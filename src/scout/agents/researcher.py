@@ -185,7 +185,7 @@ class ResearcherAgent:
             else:
                 break
 
-        return verified_findings, dropped_count
+        return verified_findings, dropped_count, attempt + 1
 
     def execute_subquestion(
         self,
@@ -197,10 +197,12 @@ class ResearcherAgent:
         all_findings: List[Finding] = []
         searches_used = 0
         pages_fetched = 0
+        llm_calls_used = 0
 
         # Step 1: Generate Queries
         try:
             queries = self.generate_queries(sub_question, remaining_budget=remaining_budget)
+            llm_calls_used += 1
         except Exception as e:
             logger.error("Query generation failed for %s: %s", sub_question.id, e)
             failures.append(ToolFailure(tool="query_gen", status="error", error_message=str(e)))
@@ -209,6 +211,7 @@ class ResearcherAgent:
                     subquestion_id=sub_question.id,
                     status="error",
                     failures=failures,
+                    llm_calls_used=llm_calls_used,
                 ),
                 [],
             )
@@ -237,6 +240,7 @@ class ResearcherAgent:
                     subquestion_id=sub_question.id,
                     status="no_results",
                     searches_used=searches_used,
+                    llm_calls_used=llm_calls_used,
                     failures=failures,
                 ),
                 [],
@@ -271,7 +275,7 @@ class ResearcherAgent:
 
             # Step 5: Extract findings & verify provenance
             try:
-                page_findings, dropped = self.extract_findings_from_passages(
+                page_findings, dropped, calls_done = self.extract_findings_from_passages(
                     sub_question=sub_question,
                     passages=top_passages,
                     page_text=fetch_res.text_content,
@@ -281,6 +285,7 @@ class ResearcherAgent:
                     title=title,
                     remaining_budget=remaining_budget,
                 )
+                llm_calls_used += calls_done
                 all_findings.extend(page_findings)
             except Exception as e:
                 logger.error("Extraction failed for %s: %s", url, e)
@@ -305,6 +310,7 @@ class ResearcherAgent:
             finding_ids=[f.finding_id for f in all_findings],
             searches_used=searches_used,
             pages_fetched=pages_fetched,
+            llm_calls_used=llm_calls_used,
             failures=failures,
         )
 

@@ -75,6 +75,7 @@ class ResearchResult(BaseModel):
     finding_ids: List[str] = Field(default_factory=list)
     searches_used: int = 0
     pages_fetched: int = 0
+    llm_calls_used: int = 0
     failures: List[ToolFailure] = Field(default_factory=list)
 
 
