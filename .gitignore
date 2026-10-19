@@ -43,6 +43,8 @@ htmlcov/
 # Redis & Local data persistence (PRD §0 #12, §10)
 data/cache/pages/
 data/redis/
+data/runs/*
+!data/runs/.gitkeep
 dump.rdb
 appendonlydir/
 

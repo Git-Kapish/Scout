@@ -10,6 +10,7 @@ from scout.agents.planner import PlannerAgent
 from scout.agents.researcher import ResearcherAgent
 from scout.agents.writer import WriterAgent
 from scout.config import get_settings
+from scout.effects.fault_injection import maybe_crash
 from scout.graph.budget_guard import check_budget_guard
 from scout.graph.state import ResearchState
 from scout.graph.supervisor import SupervisorReviewer
@@ -146,8 +147,10 @@ def review_node(state: ResearchState, supervisor_reviewer: SupervisorReviewer) -
 def write_node(state: ResearchState, writer_agent: WriterAgent) -> Dict[str, Any]:
     """Dispatches the Writer agent to synthesize accepted findings into a cited report."""
     if state.cancellation_requested:
+        maybe_crash("during_cancellation")
         return {"status": "cancelled", "termination_reason": "cancelled"}
 
+    maybe_crash("during_writing")
     accepted_findings = state.get_accepted_findings()
     logger.info("Writer synthesizing report with %d verified findings", len(accepted_findings))
 
@@ -169,6 +172,7 @@ def write_node(state: ResearchState, writer_agent: WriterAgent) -> Dict[str, Any
 
 def validate_citations_node(state: ResearchState) -> Dict[str, Any]:
     """Mechanically checks citation resolution and handles bounded regenerations."""
+    maybe_crash("during_validation")
     if not state.report:
         return {"status": "failed", "termination_reason": "missing_report"}
 

@@ -13,6 +13,7 @@ from typing import List, Optional, Tuple
 from pydantic import BaseModel, Field
 
 from scout.config import get_settings
+from scout.effects.fault_injection import maybe_crash
 from scout.fetch.fetcher import PageFetcher
 from scout.fetch.passage import select_top_passages_bm25, split_into_paragraphs
 from scout.llm import LLMClient
@@ -234,6 +235,8 @@ class ResearcherAgent:
                 if len(urls_to_fetch) < max_pages:
                     urls_to_fetch.append((hit.url, hit.domain, hit.title))
 
+        maybe_crash("mid_research_after_searches")
+
         if not urls_to_fetch:
             return (
                 ResearchResult(
@@ -250,6 +253,8 @@ class ResearcherAgent:
         for url, domain, title in urls_to_fetch:
             pages_fetched += 1
             fetch_res = self.fetcher.fetch(url)
+
+            maybe_crash("mid_research_after_fetches")
 
             if fetch_res.status != "ok":
                 failures.append(
@@ -274,6 +279,7 @@ class ResearcherAgent:
                 continue
 
             # Step 5: Extract findings & verify provenance
+            maybe_crash("mid_extraction")
             try:
                 page_findings, dropped, calls_done = self.extract_findings_from_passages(
                     sub_question=sub_question,
