@@ -24,7 +24,7 @@ def init_run_node(state: ResearchState) -> Dict[str, Any]:
     settings = get_settings()
     default_budgets = settings.budgets["default"]
 
-    wall_clock_s = state.options.get("wall_clock_s", default_budgets.wall_clock_s)
+    wall_clock_s = state.options.get("wall_clock_s") or default_budgets.wall_clock_s
     deadline_ts = time.time() + wall_clock_s
 
     logger.info("Initializing run '%s' with deadline in %ds", state.run_id, wall_clock_s)
@@ -41,9 +41,7 @@ def plan_node(state: ResearchState, planner_agent: PlannerAgent) -> Dict[str, An
         return {"status": "cancelled", "termination_reason": "cancelled"}
 
     settings = get_settings()
-    max_subq = state.options.get(
-        "max_subquestions", settings.budgets["default"].max_subquestions
-    )
+    max_subq = state.options.get("max_subquestions") or settings.budgets["default"].max_subquestions
 
     logger.info("Generating research plan for question: '%s'", state.question)
     plan = planner_agent.plan(state.question, max_subquestions=max_subq)

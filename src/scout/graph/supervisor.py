@@ -49,7 +49,7 @@ class SupervisorReviewer:
         subq_findings: List[Finding],
         state: ResearchState,
     ) -> ReviewDecision:
-        review_mode = state.options.get("review_mode", self.settings.review.mode)
+        review_mode = state.options.get("review_mode") or self.settings.review.mode
 
         # Check rework caps (PRD FR-2.3: at most 1 rework per sub-q, at most max_reworks total)
         current_sq_reworks = state.rework_counts.get(sub_question.id, 0)

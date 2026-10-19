@@ -24,6 +24,9 @@ dependencies = [
     "uvicorn>=0.30.0",
 ]
 
+[project.scripts]
+scout = "scout.cli:main"
+
 [project.optional-dependencies]
 dev = [
     "pytest>=8.2.0",

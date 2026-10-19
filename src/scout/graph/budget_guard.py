@@ -32,11 +32,11 @@ def check_budget_guard(state: ResearchState) -> Tuple[bool, Optional[str]]:
 
     # Effective limits (user options clamped to hard limits per PRD FR-2.2)
     max_tokens = min(
-        state.options.get("max_total_tokens", default_budgets.total_tokens),
+        state.options.get("max_total_tokens") or default_budgets.total_tokens,
         hard_limits.total_tokens,
     )
     max_llm_calls = min(
-        state.options.get("max_llm_calls", default_budgets.total_llm_calls),
+        state.options.get("max_llm_calls") or default_budgets.total_llm_calls,
         hard_limits.total_llm_calls,
     )
     max_reworks = min(

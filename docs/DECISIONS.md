@@ -82,5 +82,20 @@ The thin vertical slice demonstrates that:
 - **Atomic Fencing**: Stale workers with superseded generation tokens are immediately halted via `StaleWorkerError`.
 - **Integrity Verification**: 100% of exported `.jsonl` run records include matching SHA-256 integrity records.
 
-**Decision: GO to Milestone 4 (FastAPI Service & Endpoints).**
+---
+
+## 5. Milestone 4: API, Worker Daemon & Event Streaming Gate (PRD §8, FR-5.1 - FR-5.3)
+
+| Field | Value |
+|---|---|
+| **Date (UTC)** | 2026-10-19 |
+| **Milestone** | M4: API, Worker Daemon & Event Streaming |
+| **Gate Status** | **GO (PASSED)** |
+| **Endpoints Verified** | `POST /research`, `GET /research/{id}`, `GET /research/{id}/events`, `POST /research/{id}/cancel`, `POST /research/{id}/resume`, `GET /health` |
+| **Admission Control** | HTTP 429 `daily_allowance` returned when projected calls exceed remaining quota |
+| **Idempotency** | `Idempotency-Key` verified with 24h TTL; duplicate submissions return existing `run_id` without re-queuing |
+| **SSE Reconnection** | `Last-Event-ID` correctly replays past events from Redis stream before streaming live progress |
+| **CLI Client** | `scout run`, `scout watch`, `scout status`, `scout cancel`, `scout resume`, `scout worker` |
+
+**Decision: GO to Milestone 5 (Validated Report & Redacted Trace).**
 

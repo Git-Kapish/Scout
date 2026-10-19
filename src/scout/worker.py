@@ -29,6 +29,7 @@ from scout.store.ledgers import LedgerStore
 from scout.store.lua_scripts import ScriptRegistry
 from scout.store.redis_keys import (
     key_lease,
+    key_queue_runs,
     key_run_budget,
     key_run_committed,
     key_run_events,
@@ -390,3 +391,73 @@ class ResearchWorker:
                 except Exception as e:
                     logger.error("Failed to resume stalled run '%s': %s", run_id, e)
         return resumed
+
+    def process_next_run(self, **agent_kwargs) -> Optional[ResearchState]:
+        """Pops and executes the next pending run from queue:runs."""
+        raw_run_id = self.r.lpop(key_queue_runs())
+        if not raw_run_id:
+            return None
+
+        run_id = raw_run_id.decode("utf-8") if isinstance(raw_run_id, bytes) else str(raw_run_id)
+        logger.info("Worker '%s' picked up queued run '%s'", self.worker_id, run_id)
+
+        meta_raw = self.r.hgetall(key_run_meta(run_id))
+        meta = {
+            (k.decode("utf-8") if isinstance(k, bytes) else str(k)): (
+                v.decode("utf-8") if isinstance(v, bytes) else str(v)
+            )
+            for k, v in meta_raw.items()
+        }
+
+        question = meta.get("question", "")
+        options_str = meta.get("options", "{}")
+        try:
+            options = json.loads(options_str) if options_str else {}
+        except Exception:
+            options = {}
+
+        if meta.get("cancellation_requested") == "1":
+            options["cancellation_requested"] = True
+
+        return self.execute_run(
+            run_id=run_id,
+            initial_question=question,
+            options=options,
+            **agent_kwargs,
+        )
+
+    def run_worker_daemon(
+        self,
+        stop_event: Optional[threading.Event] = None,
+        poll_interval_s: float = 0.5,
+        scan_interval_s: float = 5.0,
+        **agent_kwargs,
+    ) -> None:
+        """Runs the continuous worker daemon processing queue and scanning stalled runs."""
+        logger.info("Worker '%s' daemon starting", self.worker_id)
+        stop = stop_event or threading.Event()
+        last_scan_ts = 0.0
+
+        while not stop.is_set():
+            # 1. Process queued runs
+            try:
+                state = self.process_next_run(**agent_kwargs)
+                if state:
+                    continue  # immediately check for more work
+            except Exception as e:
+                logger.error("Error processing run in worker daemon: %s", e)
+
+            # 2. Periodically scan and recover stalled runs
+            now = time.time()
+            if now - last_scan_ts >= scan_interval_s:
+                last_scan_ts = now
+                try:
+                    self.scan_and_resume_stalled_runs()
+                except Exception as e:
+                    logger.error("Error scanning stalled runs: %s", e)
+
+            # 3. Idle wait
+            stop.wait(poll_interval_s)
+
+        logger.info("Worker '%s' daemon stopped", self.worker_id)
+
