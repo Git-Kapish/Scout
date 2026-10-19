@@ -1,0 +1,148 @@
+# Scout Central Configuration (PRD §12)
+# Invariant: No model names anywhere in Python code; all must reference settings.
+
+version: "1.0"
+scout_mode: "live" # live | record | replay
+replay_live_fallback: false # PRD FR-6.2a: fail-closed by default
+
+# Roles to Provider/Model Chains (PRD §4.2, §5.3)
+roles:
+  planner:
+    primary:
+      provider: "openrouter"
+      model: "nvidia/nemotron-3.5-super-vl:free"
+      max_tokens: 2048
+      temperature: 0.1
+    fallback: null
+  
+  supervisor:
+    primary:
+      provider: "openrouter"
+      model: "nvidia/nemotron-3.5-super-vl:free"
+      max_tokens: 1024
+      temperature: 0.0
+    fallback: null
+
+  researcher_query:
+    primary:
+      provider: "openrouter"
+      model: "nvidia/nemotron-3.5-super-vl:free"
+      max_tokens: 512
+      temperature: 0.2
+    fallback: null
+
+  researcher_extract:
+    primary:
+      provider: "openrouter"
+      model: "nvidia/nemotron-3.5-super-vl:free"
+      max_tokens: 2048
+      temperature: 0.0
+    fallback: null
+
+  writer:
+    primary:
+      provider: "openrouter"
+      model: "nvidia/nemotron-3.5-super-vl:free"
+      max_tokens: 4096
+      temperature: 0.2
+    fallback: null
+
+  judge:
+    primary:
+      provider: "openrouter"
+      model: "nvidia/nemotron-3.5-super-vl:free"
+      max_tokens: 2048
+      temperature: 0.0
+    fallback: null
+
+# Providers configuration
+providers:
+  openrouter:
+    base_url: "https://openrouter.ai/api/v1"
+    env_key: "OPENROUTER_API_KEY"
+    default_rpm: 20
+    measured_r_day: 50 # Default conservative; updated by M0 recon
+    measured_date: "2026-10-19"
+    headroom_factor: 0.8
+  groq:
+    base_url: "https://api.groq.com/openai/v1"
+    env_key: "GROQ_API_KEY"
+    default_rpm: 30
+    measured_r_day: 1000
+    headroom_factor: 0.8
+
+# Budgets (PRD FR-2.2)
+budgets:
+  default:
+    max_subquestions: 5
+    queries_per_subquestion: 3
+    pages_per_subquestion: 4
+    total_llm_calls: 40 # min(60, floor(0.8 * R_day))
+    total_tokens: 150000
+    wall_clock_s: 600
+    reworks_per_subquestion: 1
+    reworks_per_run: 3
+    writer_regenerations: 2
+  hard_limits:
+    max_subquestions: 8
+    queries_per_subquestion: 5
+    pages_per_subquestion: 6
+    total_llm_calls: 100
+    total_tokens: 300000
+    wall_clock_s: 900
+    reworks_per_subquestion: 1
+    reworks_per_run: 5
+    writer_regenerations: 3
+
+# Minimum Evidence Rules (PRD FR-2.4)
+minimum_evidence:
+  min_accepted_subquestions: 2
+  min_verified_findings: 4
+  min_distinct_domains: 2
+
+# Search Configuration (PRD FR-3.1, §5.4)
+search:
+  provider_order: ["tavily", "ddgs"]
+  max_results_per_query: 5
+  max_results_per_domain: 2
+  cache_ttl_s: 86400
+
+# Fetch & Extraction Configuration (PRD FR-3.2, FR-3.3, §10)
+fetch:
+  timeout_s: 10
+  max_size_bytes: 2097152 # 2 MB
+  max_redirects: 3
+  user_agent: "ScoutResearchAgent/1.0 (+https://github.com/Git-Kapish/Scout; contact: researcher@scout.ai)"
+  bm25_top_paragraphs: 5
+  bm25_max_tokens_per_page: 1500
+  rate_limit_per_domain_s: 1.0
+
+# Supervisor Review Configuration (PRD FR-2.3)
+review:
+  mode: "deterministic_first" # deterministic_first | llm
+  runtime_support_check: false # default off (PRD §4.3 #9)
+
+# Durability & Redis Settings (PRD §9.2, FR-4.4)
+redis:
+  lease_ttl_s: 30
+  heartbeat_interval_s: 10
+  run_ttl_s: 604800 # 7 days
+  max_stream_len: 2000
+
+# Effect Ambiguity Policy (PRD FR-4.2)
+effects:
+  read_only_ambiguity_policy: "retry_at_least_once"
+  mutating_ambiguity_policy: "stop_ambiguous"
+
+# Admission Control (PRD §5.3 #7, §8)
+admission_control:
+  enabled: true
+  conservative_reserve_per_run: 35
+
+# Fault Injection (PRD FR-4.6)
+faults:
+  enabled: false # Set by SCOUT_FAULTS_ENABLED=1
+
+# Evaluation Settings (PRD §2.3)
+evaluation:
+  min_questions_for_publishable_results: 12

@@ -1,0 +1,17 @@
+# Scout Counterfactual Pricing Reference (PRD §11, §12)
+# Reference rates for hypothetical commercial equivalents (USD per 1M tokens)
+
+as_of_date: "2026-10-19"
+
+reference_models:
+  strong: # e.g., Planner / Supervisor / Writer
+    name: "gpt-4o-mini-equivalent"
+    input_per_million: 0.15
+    output_per_million: 0.60
+  
+  extraction: # e.g., Paragraph finding extraction
+    name: "llama-3-8b-equivalent"
+    input_per_million: 0.05
+    output_per_million: 0.08
+
+search_credit_reference_cost: 0.005 # USD per Tavily credit estimate

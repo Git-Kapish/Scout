@@ -1,0 +1,19 @@
+services:
+  redis:
+    image: redis/redis-stack-server:latest
+    container_name: scout-redis
+    ports:
+      - "127.0.0.1:6379:6379"
+    environment:
+      - REDIS_ARGS=--protected-mode no --appendonly yes --appendfsync everysec --maxmemory 512mb --maxmemory-policy noeviction
+    volumes:
+      - redis_data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+volumes:
+  redis_data:
