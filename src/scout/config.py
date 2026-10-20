@@ -146,8 +146,13 @@ def find_project_root() -> Path:
 
 def load_settings(config_path: Optional[Path] = None) -> Settings:
     global _SETTINGS_INSTANCE
+    root = find_project_root()
+    env_file = root / ".env"
+    if env_file.exists():
+        from dotenv import load_dotenv
+        load_dotenv(env_file)
+
     if config_path is None:
-        root = find_project_root()
         config_path = root / "config" / "settings.yaml"
 
     if not config_path.exists():

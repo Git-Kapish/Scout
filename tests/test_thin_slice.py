@@ -2,7 +2,7 @@ from scripts.thin_slice import run_thin_slice
 
 
 def test_thin_slice_execution_and_gate_pass():
-    results = run_thin_slice()
+    results = run_thin_slice(force_mock=True)
     assert results["provenance_rate"] >= 90.0
     assert results["fetch_rate"] >= 60.0
     assert results["citation_rate"] == 100.0

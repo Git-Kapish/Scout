@@ -10,7 +10,7 @@ roles:
   planner:
     primary:
       provider: "openrouter"
-      model: "nvidia/nemotron-3.5-super-vl:free"
+      model: "minimax/minimax-m3.1-flash:free"
       max_tokens: 2048
       temperature: 0.1
     fallback: null
@@ -18,7 +18,7 @@ roles:
   supervisor:
     primary:
       provider: "openrouter"
-      model: "nvidia/nemotron-3.5-super-vl:free"
+      model: "minimax/minimax-m3.1-flash:free"
       max_tokens: 1024
       temperature: 0.0
     fallback: null
@@ -26,7 +26,7 @@ roles:
   researcher_query:
     primary:
       provider: "openrouter"
-      model: "nvidia/nemotron-3.5-super-vl:free"
+      model: "minimax/minimax-m3.1-flash:free"
       max_tokens: 512
       temperature: 0.2
     fallback: null
@@ -34,7 +34,7 @@ roles:
   researcher_extract:
     primary:
       provider: "openrouter"
-      model: "nvidia/nemotron-3.5-super-vl:free"
+      model: "minimax/minimax-m3.1-flash:free"
       max_tokens: 2048
       temperature: 0.0
     fallback: null
@@ -42,7 +42,7 @@ roles:
   writer:
     primary:
       provider: "openrouter"
-      model: "nvidia/nemotron-3.5-super-vl:free"
+      model: "minimax/minimax-m3.1-flash:free"
       max_tokens: 4096
       temperature: 0.2
     fallback: null
@@ -50,10 +50,11 @@ roles:
   judge:
     primary:
       provider: "openrouter"
-      model: "nvidia/nemotron-3.5-super-vl:free"
+      model: "minimax/minimax-m3.1-flash:free"
       max_tokens: 2048
       temperature: 0.0
     fallback: null
+
 
 # Providers configuration
 providers:

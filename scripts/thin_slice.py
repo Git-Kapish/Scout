@@ -279,8 +279,8 @@ def make_mock_response(parsed_obj) -> LLMResponse:
     )
 
 
-def run_thin_slice() -> Dict[str, any]:
-    has_live_key = bool(os.getenv("OPENROUTER_API_KEY"))
+def run_thin_slice(force_mock: bool = False) -> Dict[str, any]:
+    has_live_key = bool(os.getenv("OPENROUTER_API_KEY")) and not force_mock
     logger.info("Starting M1.5 Thin Vertical Slice (live_llm=%s)...", has_live_key)
 
     total_attempted_urls = 0
@@ -406,7 +406,7 @@ def run_thin_slice() -> Dict[str, any]:
                     claims=[
                         Claim(
                             text=f"Core verified finding for {sq.id}.",
-                            finding_ids=fids[:2] if fids else [all_findings[0].finding_id],
+                            finding_ids=fids[:2] if fids else ([all_findings[0].finding_id] if all_findings else []),
                         )
                     ],
                 )
