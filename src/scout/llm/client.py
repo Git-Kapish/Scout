@@ -200,6 +200,25 @@ class LLMClient:
                     is_estimated=True,
                 )
 
+            # Early detection of empty responses from free-tier models (timeout / rate limit)
+            if response_model is not None and not content.strip():
+                attempt += 1
+                if attempt > max_retries:
+                    raise json.JSONDecodeError(
+                        "Model returned empty response after all retries",
+                        "",
+                        0,
+                    )
+                current_messages.append({"role": "assistant", "content": "(empty response)"})
+                current_messages.append({
+                    "role": "user",
+                    "content": (
+                        "Your previous response was empty. Please return ONLY valid JSON "
+                        "matching the requested schema. Keep your response concise."
+                    ),
+                })
+                continue
+
             if response_model is None:
                 return LLMResponse(
                     content=content,

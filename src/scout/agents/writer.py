@@ -79,13 +79,19 @@ class WriterAgent:
         # Format findings for Writer (PRD §4.3 #4: Writer sees findings, never raw pages)
         findings_context_lines = []
         findings_registry: Dict[str, Finding] = {}
+        # Compact mode: truncate snippets when many findings to reduce prompt size
+        compact_mode = len(findings) > 8
+        max_snippet_len = 150 if compact_mode else 500
         for f in findings:
             findings_registry[f.finding_id] = f
+            snippet_display = f.snippet
+            if len(snippet_display) > max_snippet_len:
+                snippet_display = snippet_display[:max_snippet_len] + "..."
             line = (
                 f"- ID: {f.finding_id}\n"
                 f"  SubQuestion: {f.subquestion_id}\n"
                 f"  Claim: {f.claim}\n"
-                f"  Snippet: \"{f.snippet}\"\n"
+                f"  Snippet: \"{snippet_display}\"\n"
                 f"  Source: {f.source_url} ({f.domain})"
             )
             findings_context_lines.append(line)

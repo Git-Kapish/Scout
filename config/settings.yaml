@@ -80,7 +80,7 @@ budgets:
     pages_per_subquestion: 4
     total_llm_calls: 40 # min(60, floor(0.8 * R_day))
     total_tokens: 150000
-    wall_clock_s: 600
+    wall_clock_s: 1200
     reworks_per_subquestion: 1
     reworks_per_run: 3
     writer_regenerations: 2
@@ -90,7 +90,7 @@ budgets:
     pages_per_subquestion: 6
     total_llm_calls: 100
     total_tokens: 300000
-    wall_clock_s: 900
+    wall_clock_s: 1800
     reworks_per_subquestion: 1
     reworks_per_run: 5
     writer_regenerations: 3

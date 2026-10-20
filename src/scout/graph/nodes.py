@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 import time
-from typing import Any, Dict
+from typing import Any, Dict, List, Optional
 
 from scout.agents.planner import PlannerAgent
 from scout.agents.researcher import ResearcherAgent
@@ -67,7 +67,7 @@ def pick_next_node(state: ResearchState) -> Dict[str, Any]:
     can_proceed, reason = check_budget_guard(state)
     if not can_proceed:
         logger.warning("Budget guard prevented new work dispatch: %s", reason)
-        return {"termination_reason": reason}
+        return {"termination_reason": reason, "active_subquestion_id": None}
 
     if not state.pending_subquestion_ids:
         logger.info("No more pending sub-questions in queue.")
@@ -158,13 +158,17 @@ def write_node(state: ResearchState, writer_agent: WriterAgent) -> Dict[str, Any
     if state.validation_result and not state.validation_result.valid:
         validation_feedback = "\n".join(state.validation_result.unresolved_citations)
 
-    report = writer_agent.write(
-        question=state.question,
-        plan=state.plan,
-        findings=accepted_findings,
-        abandoned_subquestions=state.abandoned_subquestion_ids,
-        validation_feedback=validation_feedback,
-    )
+    try:
+        report = writer_agent.write(
+            question=state.question,
+            plan=state.plan,
+            findings=accepted_findings,
+            abandoned_subquestions=state.abandoned_subquestion_ids,
+            validation_feedback=validation_feedback,
+        )
+    except Exception as e:
+        logger.error("Writer agent failed: %s. Generating fallback report.", e)
+        report = _build_fallback_report(state.question, accepted_findings, state.plan)
 
     ledger = state.budget_ledger
     ledger.llm_calls += 1
@@ -173,6 +177,68 @@ def write_node(state: ResearchState, writer_agent: WriterAgent) -> Dict[str, Any
         "report": report,
         "budget_ledger": ledger,
     }
+
+
+def _build_fallback_report(
+    question: str,
+    findings: List[Any],
+    plan: Optional[Any],
+) -> Any:
+    """Builds a minimal report from raw findings when the writer LLM fails entirely.
+
+    This avoids a total run failure by producing a structured but basic report
+    that still references all verified findings with proper citation chains.
+    """
+    from scout.schemas import Claim, Report, ReportSection
+
+    sections = []
+    # Group findings by subquestion_id
+    by_sq: Dict[str, list] = {}
+    for f in findings:
+        by_sq.setdefault(f.subquestion_id, []).append(f)
+
+    for sq_id, sq_findings in by_sq.items():
+        # Find the sub-question text from the plan
+        sq_text = sq_id
+        if plan:
+            for sq in plan.sub_questions:
+                if sq.id == sq_id:
+                    sq_text = sq.question
+                    break
+
+        content_parts = []
+        claims = []
+        for f in sq_findings:
+            content_parts.append(f"- {f.claim}")
+            claims.append(Claim(text=f.claim, finding_ids=[f.finding_id]))
+
+        sections.append(ReportSection(
+            title=sq_text,
+            content="\n".join(content_parts),
+            claims=claims,
+        ))
+
+    summary = (
+        f"This is an auto-generated fallback report for: {question}. "
+        f"The writer agent failed to produce a synthesized report, so findings "
+        f"are presented as-is grouped by sub-question."
+    )
+
+    # Build simple markdown
+    md_lines = [f"# {question}", "", summary, ""]
+    for section in sections:
+        md_lines.append(f"## {section.title}")
+        md_lines.append(section.content)
+        md_lines.append("")
+
+    return Report(
+        schema_version="v1",
+        title=f"Research: {question}",
+        summary=summary,
+        sections=sections,
+        coverage_gaps=[],
+        markdown="\n".join(md_lines),
+    )
 
 
 def validate_citations_node(state: ResearchState) -> Dict[str, Any]:
