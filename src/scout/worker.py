@@ -195,6 +195,12 @@ class ResearchWorker:
                 else:
                     logger.info("Starting FRESH run '%s'", run_id)
                     config = {"configurable": {"thread_id": run_id}}
+                    # Preserve existing question from metadata if available
+                    if not initial_question:
+                        stored_q = self.r.hget(meta_k, "question")
+                        if stored_q:
+                            initial_question = stored_q.decode("utf-8") if isinstance(stored_q, bytes) else str(stored_q)
+
                     input_state = ResearchState(
                         run_id=run_id,
                         question=initial_question or "",
@@ -202,16 +208,17 @@ class ResearchWorker:
                         cancellation_requested=bool(options and options.get("cancellation_requested")),
                     )
                     # Persist initial metadata
+                    meta_updates = {
+                        "run_id": run_id,
+                        "status": "running",
+                    }
+                    if initial_question:
+                        meta_updates["question"] = initial_question
                     self.registry.fenced_hset(
                         gen_k,
                         meta_k,
                         generation,
-                        {
-                            "run_id": run_id,
-                            "status": "running",
-                            "question": initial_question or "",
-                            "created_at_ts": str(time.time()),
-                        },
+                        meta_updates,
                     )
 
                 # Execute graph node-by-node via stream
@@ -398,7 +405,28 @@ class ResearchWorker:
             if not lease_val:
                 logger.info("Found stalled run '%s' with expired lease. Resuming.", run_id)
                 try:
-                    self.execute_run(run_id, force_lease=True)
+                    meta_raw = self.r.hgetall(key_run_meta(run_id))
+                    meta = {
+                        (k.decode("utf-8") if isinstance(k, bytes) else str(k)): (
+                            v.decode("utf-8") if isinstance(v, bytes) else str(v)
+                        )
+                        for k, v in meta_raw.items()
+                    }
+                    question = meta.get("question", "")
+                    options_str = meta.get("options", "{}")
+                    try:
+                        options = json.loads(options_str) if options_str else {}
+                    except Exception:
+                        options = {}
+                    if meta.get("cancellation_requested") == "1":
+                        options["cancellation_requested"] = True
+
+                    self.execute_run(
+                        run_id=run_id,
+                        initial_question=question,
+                        options=options,
+                        force_lease=True,
+                    )
                     resumed.append(run_id)
                 except Exception as e:
                     logger.error("Failed to resume stalled run '%s': %s", run_id, e)

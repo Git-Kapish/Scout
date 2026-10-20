@@ -24,3 +24,26 @@ def test_select_top_passages_bm25():
 
     assert len(selected) >= 1
     assert "Redis AOF everysec" in selected[0]
+
+
+def test_split_single_newlines():
+    # Simulates web text lacking double newlines
+    lines = [
+        f"This is informative line {i} containing substantive text about distributed consensus protocols."
+        for i in range(25)
+    ]
+    raw = "\n".join(lines)
+    paras = split_into_paragraphs(raw)
+    assert len(paras) > 1
+    for p in paras:
+        assert len(p) >= 40
+
+
+def test_bm25_strict_max_tokens():
+    # Simulates an oversized single paragraph (e.g. 10,000 chars)
+    giant_para = "Distributed consensus algorithm benchmark data. " * 300
+    paras = [giant_para]
+    selected = select_top_passages_bm25("consensus benchmark", paras, max_tokens=200)
+    assert len(selected) == 1
+    # Verify token count is strictly capped to ~200 tokens (approx 700 chars)
+    assert len(selected[0]) <= 200 * 3.5 + 50

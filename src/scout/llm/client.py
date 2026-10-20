@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import time
 from typing import Any, Dict, List, Optional, Tuple, Type, TypeVar
 
@@ -157,6 +158,9 @@ class LLMClient:
                 "max_tokens": role_cfg.max_tokens,
             }
 
+            if response_model is not None:
+                completion_kwargs["response_format"] = {"type": "json_object"}
+
             # Optional extra headers for OpenRouter identification
             extra_headers = {
                 "HTTP-Referer": "https://github.com/Git-Kapish/Scout",
@@ -164,7 +168,15 @@ class LLMClient:
             }
             completion_kwargs["extra_headers"] = extra_headers
 
-            resp = client.chat.completions.create(**completion_kwargs)
+            try:
+                resp = client.chat.completions.create(**completion_kwargs)
+            except APIStatusError as err:
+                if "response_format" in completion_kwargs and "response_format" in str(err).lower():
+                    completion_kwargs.pop("response_format", None)
+                    resp = client.chat.completions.create(**completion_kwargs)
+                else:
+                    raise
+
             latency = time.time() - start_time
 
             choice = resp.choices[0]
@@ -216,7 +228,7 @@ class LLMClient:
                 if attempt > max_retries:
                     raise ve
                 # Add validation error message for bounded retry
-                current_messages.append({"role": "assistant", "content": content})
+                current_messages.append({"role": "assistant", "content": content or "(empty response)"})
                 current_messages.append({
                     "role": "user",
                     "content": f"Output validation failed with error: {ve}. Please fix and return ONLY valid JSON matching the schema.",
@@ -227,21 +239,44 @@ class LLMClient:
     def _parse_structured_output(self, content: str, model_cls: Type[T]) -> T:
         """Extracts and parses JSON matching the Pydantic schema."""
         raw_text = content.strip()
-        # Strip markdown fences if present
-        if raw_text.startswith("```"):
-            lines = raw_text.splitlines()
-            if lines[0].startswith("```"):
-                lines = lines[1:]
-            if lines and lines[-1].startswith("```"):
-                lines = lines[:-1]
-            raw_text = "\n".join(lines).strip()
 
-        # Find first '{' or '[' if wrapped
+        # 1. Extract from markdown code fences if present (e.g. ```json ... ```)
+        fence_match = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", raw_text, re.IGNORECASE)
+        if fence_match:
+            raw_text = fence_match.group(1).strip()
+
+        # 2. Extract outermost JSON object {...} or array [...]
         start_brace = raw_text.find("{")
-        if start_brace != -1:
-            end_brace = raw_text.rfind("}")
-            if end_brace != -1:
-                raw_text = raw_text[start_brace : end_brace + 1]
+        start_bracket = raw_text.find("[")
 
-        data = json.loads(raw_text)
+        if start_brace != -1 and (start_bracket == -1 or start_brace < start_bracket):
+            end_brace = raw_text.rfind("}")
+            if end_brace != -1 and end_brace > start_brace:
+                raw_text = raw_text[start_brace : end_brace + 1]
+        elif start_bracket != -1:
+            end_bracket = raw_text.rfind("]")
+            if end_bracket != -1 and end_bracket > start_bracket:
+                raw_text = raw_text[start_bracket : end_bracket + 1]
+        else:
+            # Check for conversational refusal/empty findings for models with findings field
+            lowered = raw_text.lower()
+            if hasattr(model_cls, "model_fields") and "findings" in model_cls.model_fields:
+                if any(phrase in lowered for phrase in ("no findings", "no relevant", "not found", "no evidence", "none found")):
+                    return model_cls.model_validate({"findings": []})
+
+            raise json.JSONDecodeError(
+                f"No valid JSON object found in response. Received: {raw_text[:200]!r}",
+                raw_text,
+                0,
+            )
+
+        try:
+            data = json.loads(raw_text)
+        except json.JSONDecodeError as jde:
+            lowered = raw_text.lower()
+            if hasattr(model_cls, "model_fields") and "findings" in model_cls.model_fields:
+                if any(phrase in lowered for phrase in ("no findings", "no relevant", "not found", "no evidence", "none found")):
+                    return model_cls.model_validate({"findings": []})
+            raise jde
+
         return model_cls.model_validate(data)

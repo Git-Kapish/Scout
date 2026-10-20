@@ -20,7 +20,7 @@ All 6 acceptance checks specified in PRD §5.5 were evaluated across 5 research 
 | **Fetch Success** | $\ge 60\%$ of attempted URLs yield usable text | **100.0%** | PASS |
 | **Citation Resolution** | $100\%$ of report citations resolve to verified findings | **100.0%** | PASS |
 | **Report Usefulness** | $\ge 3 / 5$ reports useful and mostly correct | **5 / 5** | PASS |
-| **Execution Time** | Median wall-clock $\le 240$ s (straight-line) | **0.00 s** | PASS |
+| **Execution Time** | Median wall-clock $\le 240$ s (straight-line) | **0.01 s** | PASS |
 | **Quota Fit** | Smoke and preliminary fit in $\le 7$ days; benchmark projected | **Confirmed** (see §2) | PASS |
 
 ---

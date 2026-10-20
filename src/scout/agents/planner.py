@@ -32,7 +32,8 @@ Rules:
 2. Sub-questions MUST be independent: answering one must not depend on the answer to another.
 3. Keep the number of sub-questions between {min_subq} and {max_subq}.
 4. Indicate whether recent information is needed (needs_recency: true/false).
-5. Output ONLY valid JSON matching the schema. No conversational filler.
+5. Output ONLY valid JSON in this exact structure:
+{{"sub_questions": [{{"id": "sq_1", "question": "Detailed sub-question...", "rationale": "Why this is needed...", "needs_recency": false}}]}}
 """
 
 

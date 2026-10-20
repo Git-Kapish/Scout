@@ -401,6 +401,7 @@ def build_test_harness():
 
 def test_api_to_worker_end_to_end_execution(client, redis_client):
     """End-to-end flow: Client posts research run -> Worker processes run from queue -> Client queries completed state."""
+    redis_client.delete("queue:runs")
     question = "End-to-end integration test question"
     resp = client.post("/research", json={"question": question})
     assert resp.status_code == 202

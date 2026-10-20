@@ -50,9 +50,10 @@ Needs Recency: {needs_recency}
 
 Rules:
 1. Output 1 to 3 distinct queries.
-2. Use precise keywords, technical terms, and entities. Avoid conversational phrases like "can you tell me".
+2. Use precise keywords, technical terms, and entities. Avoid conversational phrases.
 3. If recency is needed, include current years/dates.
-4. Output ONLY valid JSON matching the schema.
+4. Output ONLY valid JSON in this exact structure:
+{{"queries": ["first search query", "second search query"]}}
 """
 
 EXTRACTION_PROMPT = """You are a factual evidence extraction specialist.
@@ -67,8 +68,9 @@ CRITICAL RULES:
 1. Every finding must have a 'claim' (your summary of the fact) and a 'snippet'.
 2. The 'snippet' MUST BE A STRICTLY VERBATIM, EXACT QUOTE copied word-for-word from the passages above.
    DO NOT alter or paraphrase the snippet. Any alteration will fail mechanical validation.
-3. If the passages contain no relevant facts, return an empty findings list.
-4. Output ONLY valid JSON matching the schema.
+3. If the passages contain no relevant facts, return {{"findings": []}}.
+4. Output ONLY valid JSON in this exact structure:
+{{"findings": [{{"claim": "summary of fact", "snippet": "exact quote from text"}}]}}
 """
 
 
@@ -118,7 +120,7 @@ class ResearcherAgent:
         title: Optional[str] = None,
         remaining_budget: Optional[int] = None,
         max_retries: int = 1,
-    ) -> Tuple[List[Finding], int]:
+    ) -> Tuple[List[Finding], int, int]:
         """Extracts candidate findings and validates snippet provenance verbatim."""
         passages_text = "\n\n---\n\n".join(passages)
         prompt = EXTRACTION_PROMPT.format(
@@ -135,12 +137,17 @@ class ResearcherAgent:
         dropped_count = 0
 
         while attempt <= max_retries:
-            resp = self.llm_client.generate(
-                role="researcher_extract",
-                messages=messages,
-                response_model=ExtractionOutput,
-                remaining_token_budget=remaining_budget,
-            )
+            try:
+                resp = self.llm_client.generate(
+                    role="researcher_extract",
+                    messages=messages,
+                    response_model=ExtractionOutput,
+                    remaining_token_budget=remaining_budget,
+                )
+            except Exception as e:
+                logger.warning("LLM extraction call failed on attempt %d for %s: %s", attempt, source_url, e)
+                break
+
             parsed: ExtractionOutput = resp.parsed
 
             unverified_candidates = []

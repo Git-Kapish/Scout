@@ -18,14 +18,30 @@ def tokenize(text: str) -> List[str]:
 
 
 def split_into_paragraphs(text: str) -> List[str]:
-    """Splits text by double newlines into clean, non-empty paragraphs."""
+    """Splits text into clean, non-empty paragraphs. Handles double and single newlines."""
     raw_paras = re.split(r"\n\s*\n", text)
     cleaned = []
     for p in raw_paras:
         p_clean = p.strip()
-        # Drop trivial lines (headers with 2 words, navigation fragments)
-        if len(p_clean) >= 40:
-            cleaned.append(p_clean)
+        if len(p_clean) < 40:
+            continue
+        # If paragraph is very large (e.g. single-newline separated text), split further
+        if len(p_clean) > 1200:
+            sub_lines = [line.strip() for line in p_clean.split("\n") if len(line.strip()) >= 40]
+            if len(sub_lines) > 1:
+                chunk = []
+                chunk_len = 0
+                for line in sub_lines:
+                    chunk.append(line)
+                    chunk_len += len(line)
+                    if chunk_len >= 500:
+                        cleaned.append(" ".join(chunk))
+                        chunk = []
+                        chunk_len = 0
+                if chunk:
+                    cleaned.append(" ".join(chunk))
+                continue
+        cleaned.append(p_clean)
     return cleaned
 
 
@@ -56,8 +72,13 @@ def select_top_passages_bm25(
 
     for idx, score in scored[:top_k]:
         para = paragraphs[idx]
-        # ~1 token per 3.5 chars
         para_tokens = int(len(para) / 3.5)
+        # Cap oversized individual paragraphs to max_tokens budget
+        if para_tokens > max_tokens:
+            max_chars = int(max_tokens * 3.5)
+            para = para[:max_chars]
+            para_tokens = int(len(para) / 3.5)
+
         if selected and (estimated_tokens + para_tokens > max_tokens):
             break
         selected.append(para)

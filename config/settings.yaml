@@ -11,7 +11,7 @@ roles:
     primary:
       provider: "openrouter"
       model: "minimax/minimax-m3.1-flash:free"
-      max_tokens: 2048
+      max_tokens: 4096
       temperature: 0.1
     fallback: null
   
@@ -19,7 +19,7 @@ roles:
     primary:
       provider: "openrouter"
       model: "minimax/minimax-m3.1-flash:free"
-      max_tokens: 1024
+      max_tokens: 2048
       temperature: 0.0
     fallback: null
 
@@ -27,7 +27,7 @@ roles:
     primary:
       provider: "openrouter"
       model: "minimax/minimax-m3.1-flash:free"
-      max_tokens: 512
+      max_tokens: 4096
       temperature: 0.2
     fallback: null
 
@@ -35,7 +35,7 @@ roles:
     primary:
       provider: "openrouter"
       model: "minimax/minimax-m3.1-flash:free"
-      max_tokens: 2048
+      max_tokens: 4096
       temperature: 0.0
     fallback: null
 
@@ -51,7 +51,7 @@ roles:
     primary:
       provider: "openrouter"
       model: "minimax/minimax-m3.1-flash:free"
-      max_tokens: 2048
+      max_tokens: 4096
       temperature: 0.0
     fallback: null
 
