@@ -335,3 +335,72 @@ def test_evidence_recheck_fails_when_pruning_drops_below_minimum(sample_findings
     assert res["status"] == "failed"
     assert res["termination_reason"] == "insufficient_evidence"
     assert res["report"] is None
+
+
+def test_writer_prompt_findings_capping_with_large_finding_set():
+    """Verify that WriterAgent caps findings passed to the prompt to 12 when there are >12 findings."""
+    from scout.agents.writer import WriterAgent
+    from scout.schemas import Finding, Plan, SubQuestion
+
+    mock_llm = MagicMock()
+    # Mock LLM returns a simple valid report referencing finding f_1
+    mock_llm.generate.return_value = MagicMock(
+        parsed=Report(
+            title="Title",
+            summary="Summary",
+            sections=[
+                ReportSection(
+                    title="Sec",
+                    content="Content",
+                    claims=[Claim(text="Claim", finding_ids=["f_1"])],
+                )
+            ],
+            markdown="# Report",
+        ),
+        usage=MagicMock(total_tokens=100),
+    )
+
+    writer = WriterAgent(llm_client=mock_llm)
+    plan = Plan(
+        schema_version="v1",
+        sub_questions=[
+            SubQuestion(id="sq_1", question="Q1", rationale="r1"),
+            SubQuestion(id="sq_2", question="Q2", rationale="r2"),
+            SubQuestion(id="sq_3", question="Q3", rationale="r3"),
+        ],
+    )
+
+    # 30 findings across 3 subquestions
+    many_findings = []
+    for i in range(1, 31):
+        sq_id = f"sq_{(i % 3) + 1}"
+        many_findings.append(
+            Finding(
+                finding_id=f"f_{i}",
+                subquestion_id=sq_id,
+                claim=f"Claim number {i}",
+                snippet=f"Verbatim snippet {i}",
+                source_url=f"https://source{i}.org",
+                domain=f"source{i}.org",
+                page_hash=f"hash_{i}",
+                verified=True,
+            )
+        )
+
+    report = writer.write(
+        question="Large findings test",
+        plan=plan,
+        findings=many_findings,
+    )
+
+    assert report is not None
+    # Inspect the prompt passed to mock_llm.generate
+    call_args = mock_llm.generate.call_args
+    messages = call_args.kwargs["messages"]
+    user_prompt = messages[1]["content"]
+
+    # Verify prompt contains at most 12 finding ID entries
+    import re
+    prompt_f_ids = re.findall(r"- ID: (f_\d+)", user_prompt)
+    assert len(prompt_f_ids) <= 12
+    assert len(prompt_f_ids) > 0

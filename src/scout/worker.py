@@ -223,104 +223,129 @@ class ResearchWorker:
 
                 # Execute graph node-by-node via stream
                 last_state: Optional[ResearchState] = None
-                for update in app.stream(input_state, config=config, stream_mode="updates"):
-                    # update is a dict: {node_name: {changed_state_keys...}}
-                    node_name = next(iter(update.keys())) if update else "unknown"
-                    current_seq += 1
+                try:
+                    for update in app.stream(input_state, config=config, stream_mode="updates"):
+                        # update is a dict: {node_name: {changed_state_keys...}}
+                        node_name = next(iter(update.keys())) if update else "unknown"
+                        current_seq += 1
 
-                    # Get latest saved checkpoint from state snapshot (synchronous & reliable)
-                    st_snapshot = app.get_state({"configurable": {"thread_id": run_id}})
-                    latest_cid = (
-                        st_snapshot.config.get("configurable", {}).get("checkpoint_id")
-                        if st_snapshot and st_snapshot.config
-                        else None
-                    )
-                    if not latest_cid:
-                        tup = checkpointer.get_tuple({"configurable": {"thread_id": run_id}})
-                        latest_cid = tup.checkpoint["id"] if tup and tup.checkpoint else None
+                        # Get latest saved checkpoint from state snapshot (synchronous & reliable)
+                        st_snapshot = app.get_state({"configurable": {"thread_id": run_id}})
+                        latest_cid = (
+                            st_snapshot.config.get("configurable", {}).get("checkpoint_id")
+                            if st_snapshot and st_snapshot.config
+                            else None
+                        )
+                        if not latest_cid:
+                            tup = checkpointer.get_tuple({"configurable": {"thread_id": run_id}})
+                            latest_cid = tup.checkpoint["id"] if tup and tup.checkpoint else None
 
-                    if not latest_cid or latest_cid == "unknown_cid":
-                        logger.debug("Skipping commit pointer advancement for uncheckpointed node: %s", node_name)
-                        continue
+                        if not latest_cid or latest_cid == "unknown_cid":
+                            logger.debug("Skipping commit pointer advancement for uncheckpointed node: %s", node_name)
+                            continue
 
-                    # Crash hook 5: after_checkpoint_before_commit
-                    maybe_crash("after_checkpoint_before_commit")
+                        # Crash hook 5: after_checkpoint_before_commit
+                        maybe_crash("after_checkpoint_before_commit")
 
-                    # Advance Atomic Commit Pointer (PRD FR-4.1)
-                    committed_payload = {
-                        "checkpoint_id": latest_cid,
-                        "generation": generation,
-                        "seq": current_seq,
-                        "node": node_name,
-                        "timestamp": time.time(),
-                    }
-                    commit_ok, commit_reason = self.registry.advance_commit(
+                        # Advance Atomic Commit Pointer (PRD FR-4.1)
+                        committed_payload = {
+                            "checkpoint_id": latest_cid,
+                            "generation": generation,
+                            "seq": current_seq,
+                            "node": node_name,
+                            "timestamp": time.time(),
+                        }
+                        commit_ok, commit_reason = self.registry.advance_commit(
+                            gen_key=gen_k,
+                            commit_key=commit_k,
+                            generation=generation,
+                            seq=current_seq,
+                            committed_payload=committed_payload,
+                        )
+
+                        if not commit_ok:
+                            if commit_reason == "stale_generation":
+                                logger.error(
+                                    "Worker %s generation %d is STALE for run %s. Halting.",
+                                    self.worker_id,
+                                    generation,
+                                    run_id,
+                                )
+                                raise StaleWorkerError(
+                                    f"Worker generation {generation} superseded for run '{run_id}'"
+                                )
+                            else:
+                                logger.warning(
+                                    "Commit pointer advancement rejected: %s", commit_reason
+                                )
+
+                        # Fenced sync of application read-model
+                        node_output = update[node_name]
+                        self._sync_read_model(run_id, generation, node_name, node_output)
+
+                    # Final state retrieval (query latest without pinning checkpoint_id)
+                    final_config = {"configurable": {"thread_id": run_id}}
+                    final_snapshot = app.get_state(final_config)
+                    if final_snapshot and final_snapshot.values:
+                        last_state = ResearchState.model_validate(final_snapshot.values)
+                    else:
+                        final_tuples = list(checkpointer.list({"configurable": {"thread_id": run_id}}))
+                        if final_tuples:
+                            channel_values = final_tuples[0].checkpoint.get("channel_values", {})
+                            if channel_values:
+                                last_state = ResearchState.model_validate(channel_values)
+
+                    # Mark complete & Export
+                    if last_state:
+                        self.registry.fenced_hset(
+                            gen_k,
+                            meta_k,
+                            generation,
+                            {
+                                "status": last_state.status,
+                                "completed_at_ts": str(time.time()),
+                                "termination_reason": last_state.termination_reason or "",
+                            },
+                        )
+
+                    self.exporter.export_run(run_id)
+
+                    # Release lease as terminal
+                    self.registry.release_lease(
+                        lease_key=lease_k,
                         gen_key=gen_k,
-                        commit_key=commit_k,
+                        active_runs_key=active_k,
+                        worker_id=self.worker_id,
                         generation=generation,
-                        seq=current_seq,
-                        committed_payload=committed_payload,
+                        run_id=run_id,
+                        is_terminal=True,
                     )
 
-                    if not commit_ok:
-                        if commit_reason == "stale_generation":
-                            logger.error(
-                                "Worker %s generation %d is STALE for run %s. Halting.",
-                                self.worker_id,
-                                generation,
-                                run_id,
-                            )
-                            raise StaleWorkerError(
-                                f"Worker generation {generation} superseded for run '{run_id}'"
-                            )
-                        else:
-                            logger.warning(
-                                "Commit pointer advancement rejected: %s", commit_reason
-                            )
+                    return last_state or ResearchState(run_id=run_id, question="")
 
-                    # Fenced sync of application read-model
-                    node_output = update[node_name]
-                    self._sync_read_model(run_id, generation, node_name, node_output)
-
-                # Final state retrieval (query latest without pinning checkpoint_id)
-                final_config = {"configurable": {"thread_id": run_id}}
-                final_snapshot = app.get_state(final_config)
-                if final_snapshot and final_snapshot.values:
-                    last_state = ResearchState.model_validate(final_snapshot.values)
-                else:
-                    final_tuples = list(checkpointer.list({"configurable": {"thread_id": run_id}}))
-                    if final_tuples:
-                        channel_values = final_tuples[0].checkpoint.get("channel_values", {})
-                        if channel_values:
-                            last_state = ResearchState.model_validate(channel_values)
-
-                # Mark complete & Export
-                if last_state:
+                except Exception as exc:
+                    logger.error("Run %s encountered unhandled error during execution: %s", run_id, exc)
                     self.registry.fenced_hset(
                         gen_k,
                         meta_k,
                         generation,
                         {
-                            "status": last_state.status,
+                            "status": "failed",
                             "completed_at_ts": str(time.time()),
-                            "termination_reason": last_state.termination_reason or "",
+                            "termination_reason": f"unhandled_error: {str(exc)[:100]}",
                         },
                     )
-
-                self.exporter.export_run(run_id)
-
-                # Release lease as terminal
-                self.registry.release_lease(
-                    lease_key=lease_k,
-                    gen_key=gen_k,
-                    active_runs_key=active_k,
-                    worker_id=self.worker_id,
-                    generation=generation,
-                    run_id=run_id,
-                    is_terminal=True,
-                )
-
-                return last_state or ResearchState(run_id=run_id, question="")
+                    self.exporter.export_run(run_id)
+                    self.registry.release_lease(
+                        lease_key=lease_k,
+                        gen_key=gen_k,
+                        active_runs_key=active_k,
+                        worker_id=self.worker_id,
+                        generation=generation,
+                        run_id=run_id,
+                        is_terminal=True,
+                    )
+                    raise
 
         finally:
             self.stop_heartbeat(run_id)
@@ -420,6 +445,32 @@ class ResearchWorker:
                         options = {}
                     if meta.get("cancellation_requested") == "1":
                         options["cancellation_requested"] = True
+
+                    attempts_str = meta.get("resume_attempts", "0")
+                    try:
+                        resume_attempts = int(attempts_str)
+                    except ValueError:
+                        resume_attempts = 0
+
+                    if resume_attempts >= 3:
+                        logger.warning(
+                            "Stalled run '%s' exceeded max resume attempts (%d). Marking as failed.",
+                            run_id,
+                            resume_attempts,
+                        )
+                        self.r.hset(
+                            key_run_meta(run_id),
+                            mapping={
+                                "status": "failed",
+                                "termination_reason": "max_resume_attempts_exceeded",
+                                "completed_at_ts": str(time.time()),
+                            },
+                        )
+                        self.r.srem(key_runs_active(), run_id)
+                        self.exporter.export_run(run_id)
+                        continue
+
+                    self.r.hincrby(key_run_meta(run_id), "resume_attempts", 1)
 
                     self.execute_run(
                         run_id=run_id,

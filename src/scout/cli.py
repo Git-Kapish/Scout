@@ -72,45 +72,79 @@ def cmd_run(args: argparse.Namespace) -> None:
 def cmd_watch(args: argparse.Namespace) -> None:
     api_url = args.api_url.rstrip("/")
     run_id = args.run_id
-    events_url = f"{api_url}/research/{run_id}/events"
+    last_event_id: Optional[str] = getattr(args, "last_event_id", None)
+    max_reconnects = 10
+    reconnect_delay = 2.0
 
-    console.print(f"[dim]Connecting to SSE stream: {events_url}[/]")
+    for attempt in range(max_reconnects + 1):
+        events_url = f"{api_url}/research/{run_id}/events"
+        params = {}
+        headers = {}
+        if last_event_id:
+            params["last_event_id"] = last_event_id
+            headers["Last-Event-ID"] = last_event_id
 
-    last_event_id: Optional[str] = None
-    try:
-        with httpx.stream("GET", events_url, timeout=None) as response:
-            if response.status_code == 404:
-                console.print(f"[bold red]Error:[/] Run '{run_id}' not found.")
+        if attempt == 0:
+            console.print(f"[dim]Connecting to SSE stream: {events_url}[/]")
+        else:
+            console.print(f"[dim]Reconnecting to SSE stream (attempt {attempt}, last event ID: {last_event_id or 'none'})...[/]")
+
+        try:
+            with httpx.stream("GET", events_url, params=params, headers=headers, timeout=None) as response:
+                if response.status_code == 404:
+                    console.print(f"[bold red]Error:[/] Run '{run_id}' not found.")
+                    return
+
+                event_type = "progress"
+                event_id = None
+                data_buffer = []
+
+                for line in response.iter_lines():
+                    line = line.strip()
+                    if not line:
+                        if data_buffer:
+                            raw_data = "\n".join(data_buffer)
+                            data_buffer = []
+                            _handle_event(event_type, event_id, raw_data)
+                            if event_type in ("run_completed", "run_completed_partial", "run_failed", "run_cancelled"):
+                                return
+                        event_type = "progress"
+                        event_id = None
+                        continue
+
+                    if line.startswith("id:"):
+                        event_id = line[3:].strip()
+                        last_event_id = event_id
+                    elif line.startswith("event:"):
+                        event_type = line[6:].strip()
+                    elif line.startswith("data:"):
+                        data_buffer.append(line[5:].strip())
+
+            # Normal stream termination
+            return
+
+        except KeyboardInterrupt:
+            console.print(f"\n[yellow]Interrupted by user.[/]")
+            return
+        except (httpx.RequestError, httpx.HTTPError) as e:
+            # Check if run is still in progress
+            try:
+                st = httpx.get(f"{api_url}/research/{run_id}", timeout=5.0).json()
+                if st.get("status") in ("completed", "completed_partial", "failed", "cancelled"):
+                    console.print(f"[bold green]Run reached terminal state:[/] {st.get('status')}")
+                    return
+            except Exception:
+                pass
+
+            if attempt < max_reconnects:
+                time.sleep(reconnect_delay)
+                continue
+            else:
+                console.print(
+                    f"\n[dim]Disconnected from stream ({e}). Reconnect with: scout watch {run_id} "
+                    f"(last event ID: {last_event_id or 'none'})[/]"
+                )
                 return
-
-            event_type = "progress"
-            event_id = None
-            data_buffer = []
-
-            for line in response.iter_lines():
-                line = line.strip()
-                if not line:
-                    if data_buffer:
-                        raw_data = "\n".join(data_buffer)
-                        data_buffer = []
-                        _handle_event(event_type, event_id, raw_data)
-                    event_type = "progress"
-                    event_id = None
-                    continue
-
-                if line.startswith("id:"):
-                    event_id = line[3:].strip()
-                    last_event_id = event_id
-                elif line.startswith("event:"):
-                    event_type = line[6:].strip()
-                elif line.startswith("data:"):
-                    data_buffer.append(line[5:].strip())
-
-    except (KeyboardInterrupt, httpx.RequestError) as e:
-        console.print(
-            f"\n[dim]Disconnected from stream ({e}). Reconnect with: scout watch {run_id} "
-            f"(last event ID: {last_event_id or 'none'})[/]"
-        )
 
 
 def _handle_event(event_type: str, event_id: Optional[str], raw_data: str) -> None:
@@ -241,6 +275,63 @@ def cmd_trace(args: argparse.Namespace) -> None:
     console.print(table)
 
 
+def cmd_runs(args: argparse.Namespace) -> None:
+    import redis
+    from scout.store.redis_keys import key_runs_active, key_lease
+
+    r = redis.Redis.from_url(args.redis_url)
+
+    if args.action == "purge":
+        active = r.smembers(key_runs_active())
+        purged = 0
+        for r_id_b in active:
+            r_id = r_id_b.decode("utf-8")
+            lease = r.get(key_lease(r_id))
+            if not lease or args.force:
+                r.srem(key_runs_active(), r_id)
+                r.hset(f"run:{r_id}:meta", mapping={"status": "purged", "termination_reason": "manual_purge"})
+                purged += 1
+        console.print(f"[bold green]Purged {purged} stalled run(s) from active set.[/]")
+        return
+
+    # List runs
+    table = Table(title="Scout Research Runs in Redis")
+    table.add_column("Run ID", style="cyan")
+    table.add_column("Status", style="bold")
+    table.add_column("Lease", style="green")
+    table.add_column("Question", style="white")
+
+    active_runs = {x.decode("utf-8") for x in r.smembers(key_runs_active())}
+    all_meta_keys = r.keys("run:*:meta")
+    seen_ids = set()
+
+    for k in sorted(all_meta_keys):
+        k_str = k.decode("utf-8") if isinstance(k, bytes) else str(k)
+        parts = k_str.split(":")
+        if len(parts) >= 3 and parts[0] == "run":
+            run_id = parts[1]
+            seen_ids.add(run_id)
+            meta = {k.decode("utf-8"): v.decode("utf-8") for k, v in r.hgetall(k).items()}
+            status = meta.get("status", "unknown")
+            question = meta.get("question", "")[:60]
+            has_lease = bool(r.get(key_lease(run_id)))
+
+            status_style = "green" if status in ("completed", "completed_partial") else "yellow" if status == "running" else "red"
+            lease_str = "[green]Active[/]" if has_lease else ("[red]Expired (Stalled)[/]" if run_id in active_runs else "[dim]None[/]")
+
+            table.add_row(
+                run_id,
+                f"[{status_style}]{status}[/]",
+                lease_str,
+                question,
+            )
+
+    if not seen_ids:
+        console.print("[dim]No runs found in Redis.[/]")
+    else:
+        console.print(table)
+
+
 def cmd_worker(args: argparse.Namespace) -> None:
     from scout.worker import ResearchWorker
 
@@ -296,6 +387,13 @@ def main() -> None:
     p_resume = subparsers.add_parser("resume", help="Resume a stalled research run")
     p_resume.add_argument("run_id", help="Research Run ID")
     p_resume.set_defaults(func=cmd_resume)
+
+    # runs
+    p_runs = subparsers.add_parser("runs", help="Inspect or purge research runs in Redis")
+    p_runs.add_argument("action", choices=["list", "purge"], nargs="?", default="list", help="Action (list or purge)")
+    p_runs.add_argument("--force", action="store_true", help="Force purge all active runs even if leased")
+    p_runs.add_argument("--redis-url", default="redis://127.0.0.1:6379/0", help="Redis connection URL")
+    p_runs.set_defaults(func=cmd_runs)
 
     # worker
     p_worker = subparsers.add_parser("worker", help="Run background worker daemon")

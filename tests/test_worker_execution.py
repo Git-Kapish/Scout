@@ -210,3 +210,37 @@ def test_stalled_worker_preemption_and_fencing(clean_redis):
         supervisor_reviewer=supervisor,
     )
     assert final_state.status == "completed"
+
+
+def test_stalled_worker_max_resume_attempts_exceeded():
+    from scout.store.redis_keys import key_runs_active, key_run_meta
+
+    run_id = f"stalled_max_{uuid.uuid4().hex[:8]}"
+    r = redis.Redis.from_url("redis://127.0.0.1:6379/0")
+
+    # Setup stalled run with resume_attempts = 3
+    r.sadd(key_runs_active(), run_id)
+    r.hset(
+        key_run_meta(run_id),
+        mapping={
+            "run_id": run_id,
+            "status": "running",
+            "question": "Dead run question",
+            "resume_attempts": "3",
+        },
+    )
+
+    worker = ResearchWorker(worker_id="test_worker_max")
+    resumed = worker.scan_and_resume_stalled_runs()
+
+    # The run should not have been resumed
+    assert run_id not in resumed
+
+    # The run should be marked failed with max_resume_attempts_exceeded
+    meta = {k.decode(): v.decode() for k, v in r.hgetall(key_run_meta(run_id)).items()}
+    assert meta["status"] == "failed"
+    assert meta["termination_reason"] == "max_resume_attempts_exceeded"
+
+    # And removed from active runs
+    active = [x.decode() for x in r.smembers(key_runs_active())]
+    assert run_id not in active
