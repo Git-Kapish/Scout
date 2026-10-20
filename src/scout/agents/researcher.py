@@ -68,8 +68,9 @@ CRITICAL RULES:
 1. Every finding must have a 'claim' (your summary of the fact) and a 'snippet'.
 2. The 'snippet' MUST BE A STRICTLY VERBATIM, EXACT QUOTE copied word-for-word from the passages above.
    DO NOT alter or paraphrase the snippet. Any alteration will fail mechanical validation.
-3. If the passages contain no relevant facts, return {{"findings": []}}.
-4. Output ONLY valid JSON in this exact structure:
+3. Extract between 2 and 5 of the most direct, impactful findings (do not exceed 5 findings). Keep claims and snippets concise.
+4. If the passages contain no relevant facts, return {{"findings": []}}.
+5. Output ONLY valid JSON in this exact structure:
 {{"findings": [{{"claim": "summary of fact", "snippet": "exact quote from text"}}]}}
 """
 
