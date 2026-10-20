@@ -107,3 +107,63 @@ def check_minimum_evidence(state: ResearchState) -> Tuple[bool, str]:
         )
 
     return True, "Sufficient evidence collected."
+
+
+def check_minimum_evidence_for_report(
+    report: Any,
+    findings_registry: Dict[str, Any],
+    plan_length: int = 2,
+) -> Tuple[bool, str]:
+    """Re-checks minimum evidence after unverified claims are removed (PRD FR-2.4, FR-5.4).
+
+    Evaluates that the verified findings cited by the remaining valid claims meet:
+    1. At least min_accepted_subquestions represented.
+    2. At least min_verified_findings cited.
+    3. At least min_distinct_domains cited.
+    """
+    settings = get_settings()
+    min_cfg = settings.minimum_evidence
+    required_subqs = min(min_cfg.min_accepted_subquestions, max(1, plan_length // 2))
+
+    if not report or not hasattr(report, "sections"):
+        return False, "No report structure available to evaluate."
+
+    cited_fids = set()
+    for section in report.sections:
+        for claim in getattr(section, "claims", []):
+            for fid in getattr(claim, "finding_ids", []):
+                if fid in findings_registry and getattr(findings_registry[fid], "verified", False):
+                    cited_fids.add(fid)
+
+    cited_subqs = {
+        findings_registry[fid].subquestion_id
+        for fid in cited_fids
+        if hasattr(findings_registry[fid], "subquestion_id")
+    }
+
+    cited_domains = {
+        findings_registry[fid].domain
+        for fid in cited_fids
+        if hasattr(findings_registry[fid], "domain") and findings_registry[fid].domain
+    }
+
+    if len(cited_subqs) < required_subqs:
+        return (
+            False,
+            f"Insufficient cited sub-questions after pruning: {len(cited_subqs)} < {required_subqs} required.",
+        )
+
+    if len(cited_fids) < min_cfg.min_verified_findings:
+        return (
+            False,
+            f"Insufficient verified findings cited after pruning: {len(cited_fids)} < {min_cfg.min_verified_findings} required.",
+        )
+
+    if len(cited_domains) < min_cfg.min_distinct_domains:
+        return (
+            False,
+            f"Insufficient domain diversity after pruning: {len(cited_domains)} < {min_cfg.min_distinct_domains} required.",
+        )
+
+    return True, "Pruned report satisfies minimum evidence thresholds."
+

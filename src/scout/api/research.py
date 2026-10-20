@@ -46,6 +46,7 @@ from scout.store.redis_keys import (
     key_run_meta,
     key_run_report,
 )
+from scout.trace import ResearchTraceResponse, TraceStore
 
 logger = logging.getLogger(__name__)
 
@@ -385,3 +386,30 @@ def resume_research_run(run_id: str) -> ActionResponse:
 
     logger.info("Resumed research run '%s' (previous status: %s)", run_id, status)
     return ActionResponse(run_id=run_id, status="resumed", message=f"Run '{run_id}' re-enqueued for worker pickup")
+
+
+@router.get("/{run_id}/trace", response_model=ResearchTraceResponse)
+def get_research_trace(
+    run_id: str,
+    include: Optional[str] = Query(None, description="Set to 'payloads' to inline payloads"),
+    include_payloads: bool = Query(False, description="Alternative boolean flag for inlining payloads"),
+) -> ResearchTraceResponse:
+    """Returns the ordered, redacted step-level execution trace for a research run (PRD §8, FR-5.5)."""
+    r = get_redis_client()
+    meta_raw = r.hgetall(key_run_meta(run_id))
+    if not meta_raw:
+        raise HTTPException(
+            status_code=404,
+            detail={"code": "not_found", "message": f"Research run '{run_id}' not found"},
+        )
+
+    should_include = (include == "payloads") or include_payloads
+    trace_store = TraceStore(r)
+    steps = trace_store.get_trace(run_id, include_payloads=should_include)
+
+    return ResearchTraceResponse(
+        run_id=run_id,
+        total_steps=len(steps),
+        steps=steps,
+    )
+

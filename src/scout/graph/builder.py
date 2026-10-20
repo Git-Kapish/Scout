@@ -56,6 +56,9 @@ def route_after_validation(
     state: ResearchState,
 ) -> Literal["write", "finalize", "finalize_fail"]:
     """Conditional edge from validate_citations: handles regenerations and claim stripping."""
+    if state.status == "failed" or state.termination_reason == "insufficient_evidence":
+        return "finalize_fail"
+
     if not state.validation_result:
         return "finalize_fail"
 
@@ -66,15 +69,15 @@ def route_after_validation(
     max_regenerations = settings.budgets["default"].writer_regenerations
 
     # If within regeneration budget, retry write
-    if state.writer_regenerations <= max_regenerations:
+    if state.writer_regenerations <= max_regenerations and state.report is not None:
         return "write"
 
-    # Regenerations exhausted: claims were stripped in validate_citations_node; re-check evidence
-    is_sufficient, _ = check_minimum_evidence(state)
-    if is_sufficient:
+    # Regenerations exhausted: claims were pruned and evidence checked in validate_citations_node
+    if state.report is not None:
         return "finalize"
 
     return "finalize_fail"
+
 
 
 def create_research_graph(

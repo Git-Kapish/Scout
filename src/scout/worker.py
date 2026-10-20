@@ -40,6 +40,7 @@ from scout.store.redis_keys import (
     key_run_trace,
     key_runs_active,
 )
+from scout.trace.store import TraceStore
 
 logger = logging.getLogger(__name__)
 
@@ -74,6 +75,7 @@ class ResearchWorker:
         self.registry = ScriptRegistry(self.r)
         self.ledgers = LedgerStore(self.r)
         self.exporter = RunExporter(self.r)
+        self.trace_store = TraceStore(self.r)
 
         self._heartbeat_stop_events: Dict[str, threading.Event] = {}
         self._heartbeat_threads: Dict[str, threading.Thread] = {}
@@ -367,13 +369,23 @@ class ResearchWorker:
             {"event": "node_completed", "node": node_name, "timestamp": str(time.time())},
         )
 
-        # 5. Emit trace entry to stream
-        trace_k = key_run_trace(run_id)
-        self.registry.fenced_xadd(
-            gen_k,
-            trace_k,
-            generation,
-            {"step": node_name, "status": "ok", "timestamp": str(time.time())},
+        # 5. Emit structured trace entry (PRD FR-5.5)
+        step_kind = "decision"
+        if node_name in ("plan", "write"):
+            step_kind = "llm"
+        elif node_name == "research":
+            step_kind = "tool"
+        elif node_name == "validate_citations":
+            step_kind = "validation"
+
+        self.trace_store.record_node_step(
+            run_id=run_id,
+            agent_node=node_name,
+            step_kind=step_kind,
+            input_data={"node": node_name, "generation": generation},
+            output_data=node_output,
+            generation=generation,
+            status="ok",
         )
 
     def scan_and_resume_stalled_runs(self) -> List[str]:

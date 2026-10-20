@@ -96,6 +96,7 @@ class EffectJournal:
             existing = EffectRecord.model_validate_json(raw_existing)
             if existing.state == "succeeded" and existing.output_payload is not None:
                 logger.info("Effect cache HIT for %s (attempt %s)", eff_key, existing.attempt_id)
+                self._record_trace(run_id, existing, cache_hit=True)
                 return deserialize_fn(existing.output_payload), True
 
             elif existing.state == "in_flight":
@@ -111,6 +112,7 @@ class EffectJournal:
                 else:
                     existing.state = "outcome_unknown"
                     self.r.hset(effects_key, eff_key, existing.model_dump_json())
+                    self._record_trace(run_id, existing)
                     raise RuntimeError(f"Ambiguous outcome for mutating effect: {eff_key}")
 
         # Phase 1: Persist Intent & Budget Reservation
@@ -138,6 +140,7 @@ class EffectJournal:
             record.error_message = str(e)
             record.completed_at_ts = time.time()
             self.r.hset(effects_key, eff_key, record.model_dump_json())
+            self._record_trace(run_id, record)
             raise
 
         # Crash hook 3: after_dispatch_before_persist
@@ -149,11 +152,19 @@ class EffectJournal:
         record.output_payload = serialized_output
         record.completed_at_ts = time.time()
         self.r.hset(effects_key, eff_key, record.model_dump_json())
+        self._record_trace(run_id, record)
 
         # Crash hook 4: after_persist_before_checkpoint
         maybe_crash("after_persist_before_checkpoint")
 
         return result, False
+
+    def _record_trace(self, run_id: str, record: EffectRecord, cache_hit: bool = False) -> None:
+        try:
+            from scout.trace.store import TraceStore
+            TraceStore(self.r).record_effect_step(run_id, record, cache_hit=cache_hit)
+        except Exception as e:
+            logger.warning("Failed to record trace for effect %s: %s", record.effect_key, e)
 
     def get_effect_record(self, run_id: str, effect_key: str) -> Optional[EffectRecord]:
         raw = self.r.hget(key_run_effects(run_id), effect_key)
@@ -164,3 +175,4 @@ class EffectJournal:
     def list_run_effects(self, run_id: str) -> list[EffectRecord]:
         raw_dict = self.r.hgetall(key_run_effects(run_id))
         return [EffectRecord.model_validate_json(v) for v in raw_dict.values()]
+

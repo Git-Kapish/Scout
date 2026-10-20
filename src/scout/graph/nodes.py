@@ -11,10 +11,11 @@ from scout.agents.researcher import ResearcherAgent
 from scout.agents.writer import WriterAgent
 from scout.config import get_settings
 from scout.effects.fault_injection import maybe_crash
-from scout.graph.budget_guard import check_budget_guard
+from scout.graph.budget_guard import check_budget_guard, check_minimum_evidence_for_report
 from scout.graph.state import ResearchState
 from scout.graph.supervisor import SupervisorReviewer
 from scout.validate.citation_validator import validate_report_citations
+from scout.validate.markdown_renderer import render_markdown_report
 
 logger = logging.getLogger(__name__)
 
@@ -152,11 +153,17 @@ def write_node(state: ResearchState, writer_agent: WriterAgent) -> Dict[str, Any
     accepted_findings = state.get_accepted_findings()
     logger.info("Writer synthesizing report with %d verified findings", len(accepted_findings))
 
+    # Pass feedback if regenerating after a failed validation attempt (PRD FR-5.4)
+    validation_feedback = None
+    if state.validation_result and not state.validation_result.valid:
+        validation_feedback = "\n".join(state.validation_result.unresolved_citations)
+
     report = writer_agent.write(
         question=state.question,
         plan=state.plan,
         findings=accepted_findings,
         abandoned_subquestions=state.abandoned_subquestion_ids,
+        validation_feedback=validation_feedback,
     )
 
     ledger = state.budget_ledger
@@ -169,7 +176,7 @@ def write_node(state: ResearchState, writer_agent: WriterAgent) -> Dict[str, Any
 
 
 def validate_citations_node(state: ResearchState) -> Dict[str, Any]:
-    """Mechanically checks citation resolution and handles bounded regenerations."""
+    """Mechanically checks citation resolution, handles bounded regenerations, and re-checks evidence."""
     maybe_crash("during_validation")
     if not state.report:
         return {"status": "failed", "termination_reason": "missing_report"}
@@ -187,7 +194,7 @@ def validate_citations_node(state: ResearchState) -> Dict[str, Any]:
     current_regenerations = state.writer_regenerations
     if current_regenerations < max_regenerations:
         logger.warning(
-            "Citation resolution failed (attempt %d/%d). Triggering Writer regeneration.",
+            "Citation resolution failed (attempt %d/%d). Triggering Writer regeneration with feedback.",
             current_regenerations + 1,
             max_regenerations,
         )
@@ -196,10 +203,36 @@ def validate_citations_node(state: ResearchState) -> Dict[str, Any]:
             "writer_regenerations": current_regenerations + 1,
         }
 
-    # Max regenerations exhausted: drop unresolved claims & re-check minimum evidence (PRD FR-5.4)
+    # Max regenerations exhausted: drop unresolved claims & re-check minimum evidence (PRD FR-5.4, FR-2.4)
     logger.warning("Writer regenerations exhausted. Dropping unverified claims.")
     for section in state.report.sections:
         section.claims = [c for c in section.claims if c not in validation.dropped_claims]
+
+    plan_len = len(state.plan.sub_questions) if state.plan else 2
+    evidence_ok, reason = check_minimum_evidence_for_report(
+        state.report,
+        findings_registry,
+        plan_length=plan_len,
+    )
+
+    if not evidence_ok:
+        logger.warning("Pruned report failed minimum evidence re-check: %s", reason)
+        return {
+            "status": "failed",
+            "termination_reason": "insufficient_evidence",
+            "validation_result": validation,
+            "report": None,
+        }
+
+    # Re-render markdown from validated structure without unresolved citations
+    state.report.markdown = render_markdown_report(
+        title=state.report.title,
+        summary=state.report.summary,
+        sections=state.report.sections,
+        findings_registry=findings_registry,
+        coverage_gaps=state.report.coverage_gaps,
+        dropped_claims=validation.dropped_claims,
+    )
 
     return {
         "validation_result": validation,
@@ -211,8 +244,9 @@ def finalize_node(state: ResearchState) -> Dict[str, Any]:
     """Finalizes successful or partial research run."""
     has_abandoned = len(state.abandoned_subquestion_ids) > 0
     has_budget_stopped = state.termination_reason is not None
+    had_dropped_claims = bool(state.validation_result and state.validation_result.dropped_claims)
 
-    status = "completed_partial" if (has_abandoned or has_budget_stopped) else "completed"
+    status = "completed_partial" if (has_abandoned or has_budget_stopped or had_dropped_claims) else "completed"
     logger.info("Run '%s' finalized as '%s'", state.run_id, status)
     return {
         "status": status,

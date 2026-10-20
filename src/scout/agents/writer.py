@@ -49,6 +49,9 @@ STRICT INVARIANTS:
 """
 
 
+from scout.validate.markdown_renderer import render_markdown_report
+
+
 class WriterAgent:
     def __init__(self, llm_client: Optional[LLMClient] = None):
         self.llm_client = llm_client or LLMClient()
@@ -61,6 +64,7 @@ class WriterAgent:
         findings: List[Finding],
         abandoned_subquestions: Optional[List[str]] = None,
         remaining_budget: Optional[int] = None,
+        validation_feedback: Optional[str] = None,
     ) -> Report:
         abandoned = abandoned_subquestions or []
 
@@ -91,10 +95,21 @@ class WriterAgent:
 
         plan_summary = "\n".join(f"- {sq.id}: {sq.question}" for sq in plan.sub_questions)
 
+        feedback_section = ""
+        if validation_feedback:
+            feedback_section = (
+                f"\n\nATTENTION - PREVIOUS ATTEMPT CITATION VALIDATION FAILED:\n"
+                f"{validation_feedback}\n"
+                "Please regenerate the report strictly resolving these issues. "
+                "Ensure every claim has at least one valid finding_id from the list above, "
+                "and NEVER hallucinate finding IDs.\n"
+            )
+
         user_content = (
             f"Research Question: {question}\n\n"
             f"Original Plan:\n{plan_summary}\n\n"
-            f"VERIFIED FINDINGS:\n{findings_text}\n\n"
+            f"VERIFIED FINDINGS:\n{findings_text}"
+            f"{feedback_section}\n\n"
             "Write the comprehensive research report."
         )
 
@@ -119,12 +134,12 @@ class WriterAgent:
         ]
 
         # Build Markdown rendering (PRD FR-5.4)
-        markdown = self._render_markdown(
+        markdown = render_markdown_report(
             title=parsed.title,
             summary=parsed.summary,
             sections=sections,
-            coverage_gaps=coverage_gaps,
             findings_registry=findings_registry,
+            coverage_gaps=coverage_gaps,
         )
 
         return Report(
@@ -144,57 +159,12 @@ class WriterAgent:
         coverage_gaps: List[str],
         findings_registry: Dict[str, Finding],
     ) -> str:
-        lines = [f"# {title}", "", f"**Executive Summary:** {summary}", ""]
+        return render_markdown_report(
+            title=title,
+            summary=summary,
+            sections=sections,
+            findings_registry=findings_registry,
+            coverage_gaps=coverage_gaps,
+        )
 
-        # Number citations sequentially as they appear
-        citation_map: Dict[str, int] = {}
-        next_num = 1
 
-        for section in sections:
-            lines.append(f"## {section.title}")
-            lines.append("")
-            lines.append(section.content)
-            lines.append("")
-
-            # In-line citations per claim
-            if section.claims:
-                lines.append("**Key Supported Claims:**")
-                for claim in section.claims:
-                    cit_labels = []
-                    for fid in claim.finding_ids:
-                        if fid not in citation_map:
-                            citation_map[fid] = next_num
-                            next_num += 1
-                        cit_labels.append(f"[{citation_map[fid]}]")
-                    cit_str = "".join(cit_labels)
-                    lines.append(f"- {claim.text} {cit_str}")
-                lines.append("")
-
-        if coverage_gaps:
-            lines.append("## Coverage Gaps")
-            lines.append("The following planned sub-topics lacked sufficient verified evidence:")
-            for gap in coverage_gaps:
-                lines.append(f"- {gap}")
-            lines.append("")
-
-        # Bibliography / Sources
-        lines.append("## References")
-        if citation_map:
-            # Sort by citation index
-            sorted_citations = sorted(citation_map.items(), key=lambda x: x[1])
-            for fid, num in sorted_citations:
-                finding = findings_registry.get(fid)
-                if finding:
-                    source_title = finding.title or finding.domain
-                    retrieved_str = finding.retrieved_at.strftime("%Y-%m-%d")
-                    lines.append(
-                        f"[{num}] **{source_title}** - [{finding.source_url}]({finding.source_url}) "
-                        f"(Retrieved {retrieved_str})"
-                    )
-                    lines.append(f"    *Quote: \"{finding.snippet}\"*")
-                else:
-                    lines.append(f"[{num}] Finding ID: {fid}")
-        else:
-            lines.append("No citations recorded.")
-
-        return "\n".join(lines)

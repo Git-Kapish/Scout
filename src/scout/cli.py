@@ -196,6 +196,51 @@ def cmd_resume(args: argparse.Namespace) -> None:
     console.print(f"Resume Response ({resp.status_code}): {resp.json()}")
 
 
+def cmd_trace(args: argparse.Namespace) -> None:
+    api_url = args.api_url.rstrip("/")
+    url = f"{api_url}/research/{args.run_id}/trace"
+    if args.include_payloads:
+        url += "?include=payloads"
+
+    try:
+        resp = httpx.get(url, timeout=10.0)
+    except Exception as e:
+        console.print(f"[bold red]Error connecting to Scout API:[/] {e}")
+        sys.exit(1)
+
+    if resp.status_code != 200:
+        console.print(f"[bold red]Error ({resp.status_code}):[/] {resp.text}")
+        sys.exit(1)
+
+    data = resp.json()
+    console.print(Panel(f"[bold]Run ID:[/] {data['run_id']}\n[bold]Total Steps:[/] {data['total_steps']}", title="Scout Execution Trace (PRD FR-5.5)"))
+
+    table = Table(title="Step Log")
+    table.add_column("Index", style="dim")
+    table.add_column("Agent / Node", style="cyan")
+    table.add_column("Kind", style="magenta")
+    table.add_column("Tool / Model", style="green")
+    table.add_column("Status", style="bold")
+    table.add_column("Latency (ms)", justify="right")
+    table.add_column("Preview (Output)", style="white")
+
+    for idx, step in enumerate(data.get("steps", []), start=1):
+        status_style = "green" if step.get("status") == "ok" else "red"
+        tool_or_model = step.get("tool_name") or step.get("model") or "-"
+        preview = step.get("produced_output", {}).get("preview", "")[:60]
+        table.add_row(
+            str(idx),
+            step.get("agent_node", "-"),
+            step.get("step_kind", "-"),
+            tool_or_model,
+            f"[{status_style}]{step.get('status', 'ok')}[/]",
+            f"{step.get('latency_ms', 0.0):.1f}",
+            preview,
+        )
+
+    console.print(table)
+
+
 def cmd_worker(args: argparse.Namespace) -> None:
     from scout.worker import ResearchWorker
 
@@ -235,6 +280,12 @@ def main() -> None:
     p_status = subparsers.add_parser("status", help="Get run status and report")
     p_status.add_argument("run_id", help="Research Run ID")
     p_status.set_defaults(func=cmd_status)
+
+    # trace
+    p_trace = subparsers.add_parser("trace", help="Get ordered step trace for a run")
+    p_trace.add_argument("run_id", help="Research Run ID")
+    p_trace.add_argument("--include-payloads", action="store_true", help="Inline full payloads")
+    p_trace.set_defaults(func=cmd_trace)
 
     # cancel
     p_cancel = subparsers.add_parser("cancel", help="Cancel an active research run")
