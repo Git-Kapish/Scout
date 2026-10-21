@@ -1,0 +1,76 @@
+{
+  "n_questions": 10,
+  "timestamp": "2026-10-21T06:20:11.066200+00:00",
+  "git_commit": "fa625e9966e1b3384860aedd711ddad8c8643d81",
+  "config_hash": "59fd0e421123be50",
+  "provider": "openrouter",
+  "model": "minimax/minimax-m3.1-flash:free",
+  "measured_allowance": {
+    "daily_requests": 50,
+    "rpm": 20,
+    "measured_date": "2026-10-19"
+  },
+  "timing": {
+    "p50_wall_clock_s": 483.03,
+    "p95_wall_clock_s": 577.18,
+    "min_wall_clock_s": 378.42,
+    "max_wall_clock_s": 587.64
+  },
+  "resources": {
+    "mean_llm_calls": 9.5,
+    "mean_tokens": 0.0,
+    "mean_searches": 5.0,
+    "mean_fetches": 7.5
+  },
+  "quality": {
+    "mean_citation_resolution_rate": 0.5,
+    "mean_provenance_rate": 1.0,
+    "success_rate": 0.5
+  },
+  "runs": [
+    {
+      "question_id": "m6_q1",
+      "question": "Compare the main approaches to retrieval-augmented generation evaluation and what each measures.",
+      "type": "comparative",
+      "run_id": "m6_eval_01_m6_q1",
+      "status": "completed",
+      "termination_reason": "",
+      "wall_clock_s": 587.64,
+      "llm_calls": 10,
+      "tokens_in": 0,
+      "tokens_out": 0,
+      "total_tokens": 0,
+      "searches": 4,
+      "fetches": 6,
+      "subquestions_count": 2,
+      "findings_count": 74,
+      "provenance_rate": 1.0,
+      "citations_total": 11,
+      "citations_resolved": 11,
+      "citation_resolution_rate": 1.0,
+      "report_summary": "The verified evidence supports a layered evaluation model: component-level evaluation measures retriever and generator quality and their interaction, "
+    },
+    {
+      "question_id": "m6_q2",
+      "question": "What changed in the EU AI Act's general-purpose model obligations over the last year?",
+      "type": "recency_sensitive",
+      "run_id": "m6_eval_02_m6_q2",
+      "status": "failed",
+      "termination_reason": "insufficient_evidence",
+      "wall_clock_s": 378.42,
+      "llm_calls": 9,
+      "tokens_in": 0,
+      "tokens_out": 0,
+      "total_tokens": 0,
+      "searches": 6,
+      "fetches": 9,
+      "subquestions_count": 2,
+      "findings_count": 30,
+      "provenance_rate": 1.0,
+      "citations_total": 0,
+      "citations_resolved": 0,
+      "citation_resolution_rate": 0.0,
+      "report_summary": ""
+    }
+  ]
+}

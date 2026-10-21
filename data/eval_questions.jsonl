@@ -1,0 +1,10 @@
+{"id": "m6_q1", "type": "comparative", "question": "Compare the main approaches to retrieval-augmented generation evaluation and what each measures."}
+{"id": "m6_q2", "type": "recency_sensitive", "question": "What changed in the EU AI Act's general-purpose model obligations over the last year?"}
+{"id": "m6_q3", "type": "technical_factual", "question": "How do modern speculative decoding techniques achieve inference speedups in large language models?"}
+{"id": "m6_q4", "type": "technical_factual", "question": "What are the trade-offs between Redis AOF everysec vs always in terms of throughput and data loss?"}
+{"id": "m6_q5", "type": "comparative", "question": "Analyze the architectural differences between LangGraph and Autogen for stateful workflows."}
+{"id": "m6_q6", "type": "multi_part_factual", "question": "What are the proven environmental impacts of datacenter water cooling in dry climates?"}
+{"id": "m6_q7", "type": "legal_policy", "question": "How does the UK's copyright legal framework address generative AI training on public web data?"}
+{"id": "m6_q8", "type": "technical_factual", "question": "What is the mathematical formulation of BM25Okapi and how does document length normalization work?"}
+{"id": "m6_q9", "type": "comparative", "question": "Compare the latency and throughput characteristics of Groq LPUs versus Nvidia H100 GPUs for Llama-3."}
+{"id": "m6_q10", "type": "security", "question": "What are the established mitigation strategies for Server-Side Request Forgery in modern microservices?"}

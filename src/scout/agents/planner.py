@@ -49,8 +49,9 @@ class PlannerAgent:
         remaining_budget: Optional[int] = None,
     ) -> Plan:
         max_subq = max_subquestions or self.settings.budgets["default"].max_subquestions
+        min_sub = 1 if max_subq <= 1 else 2
         system_content = PLANNER_SYSTEM_PROMPT.format(
-            min_subq=2,
+            min_subq=min_sub,
             max_subq=max_subq,
         )
 

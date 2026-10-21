@@ -11,7 +11,7 @@ Invariants:
 from __future__ import annotations
 
 import logging
-from typing import Dict, List, Optional, Union
+from typing import Dict, List, Optional
 
 from pydantic import BaseModel, Field
 
@@ -22,17 +22,12 @@ from scout.schemas import Claim, Finding, Plan, Report, ReportSection
 logger = logging.getLogger(__name__)
 
 
-class WriterClaimInput(BaseModel):
-    text: str
-    finding_ids: List[str] = Field(default_factory=list)
-
-
 class WriterSectionOutput(BaseModel):
     title: str
     content: str
-    claims: List[Union[WriterClaimInput, Claim]] = Field(
+    claims: List[Claim] = Field(
         default_factory=list,
-        description="List of factual claims made in this section, citing finding_ids",
+        description="List of factual claims made in this section, each citing at least one finding_id",
     )
 
 
@@ -152,15 +147,11 @@ class WriterAgent:
 
         parsed: WriterOutputSchema = resp.parsed
 
-        # Convert to Report model, keeping only claims with at least one finding citation
-        sections = []
-        for s in parsed.sections:
-            valid_claims = [
-                Claim(text=c.text, finding_ids=c.finding_ids)
-                for c in s.claims
-                if c.finding_ids
-            ]
-            sections.append(ReportSection(title=s.title, content=s.content, claims=valid_claims))
+        # Convert to Report model
+        sections = [
+            ReportSection(title=s.title, content=s.content, claims=s.claims)
+            for s in parsed.sections
+        ]
 
         # Build Markdown rendering (PRD FR-5.4)
         markdown = render_markdown_report(

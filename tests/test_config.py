@@ -5,7 +5,7 @@ def test_settings_load():
     settings = get_settings()
     assert settings.version == "1.0"
     assert "planner" in settings.roles
-    assert settings.get_role_primary("planner").model == "deepseek/deepseek-v4.1-flash-1017"
+    assert settings.get_role_primary("planner").model == "minimax/minimax-m3.1-flash:free"
     assert settings.budgets["default"].total_llm_calls == 40
     assert settings.minimum_evidence.min_verified_findings == 4
 
