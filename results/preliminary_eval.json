@@ -29,10 +29,10 @@
   },
   "runs": [
     {
-      "question_id": "m6_q1",
+      "question_id": "q1",
       "question": "Compare the main approaches to retrieval-augmented generation evaluation and what each measures.",
       "type": "comparative",
-      "run_id": "m6_eval_01_m6_q1",
+      "run_id": "eval_01_q1",
       "status": "completed",
       "termination_reason": "",
       "wall_clock_s": 587.64,
@@ -51,10 +51,10 @@
       "report_summary": "The verified evidence supports a layered evaluation model: component-level evaluation measures retriever and generator quality and their interaction, "
     },
     {
-      "question_id": "m6_q2",
+      "question_id": "q2",
       "question": "What changed in the EU AI Act's general-purpose model obligations over the last year?",
       "type": "recency_sensitive",
-      "run_id": "m6_eval_02_m6_q2",
+      "run_id": "eval_02_q2",
       "status": "failed",
       "termination_reason": "insufficient_evidence",
       "wall_clock_s": 378.42,

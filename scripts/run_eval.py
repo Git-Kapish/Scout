@@ -33,7 +33,7 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
     datefmt="%H:%M:%S",
 )
-logger = logging.getLogger("m6_eval")
+logger = logging.getLogger("eval_runner")
 
 
 def get_git_commit() -> str:
@@ -86,7 +86,7 @@ def run_evaluation() -> Dict[str, Any]:
         q_id = q_item["id"]
         q_text = q_item["question"]
         q_type = q_item.get("type", "general")
-        run_id = f"m6_eval_{idx:02d}_{q_id}"
+        run_id = f"eval_{idx:02d}_{q_id}"
 
         if q_id in existing_records:
             logger.info("[%d/%d] Skipping already completed question '%s': '%s'", idx, len(questions), q_id, q_text)
