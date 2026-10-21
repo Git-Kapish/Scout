@@ -1,341 +1,380 @@
-# Scout: Autonomous, Durable, Budgeted Multi-Agent Research Assistant
+# Scout
 
-[![Python 3.12](https://img.shields.io/badge/python-3.12-blue.svg)](https://www.python.org/)
-[![LangGraph](https://img.shields.io/badge/orchestration-LangGraph-orange.svg)](https://github.com/langchain-ai/langgraph)
-[![Redis](https://img.shields.io/badge/persistence-Redis%207%2B-red.svg)](https://redis.io/)
-[![FastAPI](https://img.shields.io/badge/api-FastAPI-green.svg)](https://fastapi.tiangolo.com/)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Spend Constraint](https://img.shields.io/badge/spend%20constraint-%240.00%20(Free%20Tier)-brightgreen.svg)]()
+A durable, budget-enforced, citation-verified multi-agent research assistant.
 
-> **Durable, budget-enforced, and verifiably grounded multi-agent deep research powered entirely by free-tier LLMs.**
+Scout conducts structured web research using free-tier language models and search providers. It decomposes a question into sub-questions, gathers source material in parallel, extracts evidence, evaluates coverage, synthesizes a report, and validates citations against the fetched page text.
 
----
+[![Python 3.12](https://img.shields.io/badge/Python-3.12-blue.svg)](https://www.python.org/)
+[![LangGraph](https://img.shields.io/badge/Orchestration-LangGraph-orange.svg)](https://github.com/langchain-ai/langgraph)
+[![FastAPI](https://img.shields.io/badge/API-FastAPI-009688.svg)](https://fastapi.tiangolo.com/)
+[![Redis 7+](https://img.shields.io/badge/Storage-Redis%207%2B-DC382D.svg)](https://redis.io/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
+## Contents
+
+- [Overview](#overview)
+- [How It Works](#how-it-works)
+- [Architecture](#architecture)
+- [Core Engineering Design](#core-engineering-design)
+- [Features](#features)
+- [Evaluation Results](#evaluation-results)
+- [Getting Started](#getting-started)
+- [CLI Usage](#cli-usage)
+- [REST API](#rest-api)
+- [Testing and Evaluation](#testing-and-evaluation)
+- [Repository Structure](#repository-structure)
+- [Limitations](#limitations)
+- [Documentation](#documentation)
+- [License](#license)
 
 ## Overview
 
-**Scout** is an autonomous multi-agent research service engineered to execute deep web investigations without succumbing to the pitfalls of conventional agent frameworks: unhandled process crashes, runaway token costs, rate-limit bans, and hallucinated citations.
+Research agents must do more than produce plausible prose. They need to survive process failures, respect provider quotas, make their activity observable, and substantiate claims with sources that actually support them.
 
-Operating under a strict **USD 0 budget constraint** on free-tier models (such as OpenRouter `:free` tiers and Tavily / DuckDuckGo search), Scout coordinates a stateful graph of specialized agents:
+Scout is designed around those requirements. A research run is checkpointed in Redis, worker ownership is protected by leases and generation counters, resource budgets are checked before and during execution, and report citations are mechanically validated against stored evidence.
 
-1. **Planner Agent**: Decomposes complex user queries into independent, highly specific sub-questions.
-2. **Parallel Researcher Agent**: Formulates diverse search queries, fetches source documents via Trafilatura, filters passages with BM25, and extracts evidence.
-3. **Supervisor Reviewer Agent**: Evaluates evidence quality, rejecting inadequate findings and requesting targeted rework loops within strict iteration caps.
-4. **Writer Agent**: Synthesizes verified findings into a cohesive, structured narrative answer.
-5. **Citation & Integrity Validator**: Mechanically audits that 100% of claims are grounded in verbatim page quotes and correctly linked in the bibliography.
+The project provides a FastAPI service, a background worker, and a command-line interface. It uses LangGraph to orchestrate the research workflow and is configured to operate with free-tier model and search-provider access. Actual availability, quotas, and latency depend on the providers and models configured for a run.
 
-Scout presents **direct narrative answers first**, followed by **verified citations**, source URLs, and a comprehensive **schema integrity audit**.
+### Problems and design responses
 
----
+| Problem | Scout's approach |
+|---|---|
+| A worker crash loses progress | Persist graph checkpoints in Redis and resume from the last committed checkpoint |
+| Multiple workers act on the same run | Atomic Lua leases and generation counters fence out stale workers |
+| Runs consume excessive resources | Enforce per-run and daily limits for time, model calls, tokens, searches, and page fetches |
+| Reports contain unsupported citations | Match extracted evidence to fetched text and validate citation references before publication |
+| Execution is difficult to inspect | Record ordered trace events and stream progress through Server-Sent Events (SSE) |
 
-## Key Capabilities
+## How It Works
 
-- **Crash-Resilient State Persistence**: Backed by Redis AOF and LangGraph `RedisSaver`. Active runs are guarded by atomic Lua-scripted leases (`acquire_lease.lua`, `renew_lease.lua`, `advance_commit.lua`) and monotonically increasing generation counters. Stalled or crashed workers can be resumed from the exact last committed checkpoint without split-brain side effects.
-- **Hardware-Enforced Run & Quota Budgets**: Enforces strict admission control at the API layer. Runs are tracked in atomic Redis ledgers across wall-clock time, LLM calls, input/output tokens, search queries, and page fetches. If limits are reached, the orchestrator triggers graceful early synthesis rather than failing.
-- **Mechanical Provenance & Citation Validation**: Rejects hallucinations at the source. Extracted facts must match the raw HTML/text verbatim or they are dropped. Final reports must satisfy Pydantic `ReportSchema v1` with 100% citation resolution before publication.
-- **Dual-Mode Interactive CLI**: Offers a rich terminal experience with live streaming progress, single-shot queries, and an interactive research shell.
-- **Full Trace Observability**: Every tool execution, model call, latency measurement, and event is recorded into an append-only trace log and streamed via real-time Server-Sent Events (SSE).
+Scout uses a stateful LangGraph workflow with five stages.
 
----
+| Stage | Responsibility |
+|---|---|
+| **Planner** | Decomposes a research question into specific, independent sub-questions |
+| **Researcher** | Generates search queries, fetches pages with Trafilatura, ranks passages using BM25, and extracts evidence |
+| **Supervisor** | Assesses evidence quality and requests targeted additional research within configured iteration limits |
+| **Writer** | Synthesizes findings into a structured report |
+| **Citation validator** | Validates report structure and checks that citations resolve to stored findings grounded in source text |
 
-## Empirical Evaluation Results
+A completed run returns a structured answer, citations with source URLs, and a schema and integrity audit.
 
-Scout was evaluated across representative multi-part research questions from the evaluation suite (`data/eval_questions.jsonl`).
+## Architecture
 
-### 1. Release 1 Baseline Performance
+```mermaid
+flowchart TD
+    User[CLI or HTTP API] --> API[FastAPI admission control]
+    API --> Queue[(Redis run queue)]
+    Queue --> Worker[Worker daemon with lease and generation counter]
 
-| Metric | Measured Result | PRD Specification | Evaluation Status |
-| :--- | :--- | :--- | :--- |
-| **Citation Resolution Rate** | **100.0%** | 100.0% | **PASS** |
-| **Snippet Provenance Rate** | **100.0%** (verbatim verified) | $\ge 90.0\%$ | **PASS** |
-| **Mean LLM Calls / Run** | **9.5 calls** | $\le 40$ calls | **PASS** |
-| **Mean Searches / Run** | **5.0 searches** | $\le 12$ searches | **PASS** |
-| **Mean Fetches / Run** | **7.5 fetches** | $\le 18$ fetches | **PASS** |
-| **p50 Wall-Clock Latency** | **483.0 s** | $\le 300$ s target | **ACCEPTABLE** *(due to public free-tier rate queues)* |
-| **p95 Wall-Clock Latency** | **577.2 s** | - | **OBSERVED** |
+    subgraph Research[LangGraph research workflow]
+        Planner[1. Planner] --> Researcher[2. Parallel researcher]
+        Researcher --> Supervisor[3. Evidence supervisor]
+        Supervisor -->|Additional evidence required| Researcher
+        Supervisor --> Writer[4. Writer]
+        Writer --> Validator[5. Citation validator]
+    end
 
-*Detailed run-by-run breakdown and logs are documented in [`docs/preliminary_eval.md`](docs/preliminary_eval.md) and [`results/preliminary_eval.json`](results/preliminary_eval.json).*
-
-### 2. Planner Isolation Quality Rubric
-
-Evaluated across 10 complex questions (30 generated sub-questions) scored on a 1–5 scale:
-
-| Metric | Measured Score | Passing Threshold | Result |
-| :--- | :--- | :--- | :--- |
-| **Sub-Question Specificity** | **4.67 / 5.0** | $\ge 4.0 / 5.0$ | **PASS** |
-| **Sub-Question Independence** | **5.00 / 5.0** | $\ge 4.0 / 5.0$ | **PASS** |
-
-*Complete scoring rubrics and question breakdowns are in [`docs/planner_eval.md`](docs/planner_eval.md).*
-
-### 3. Thin-Slice Acceptance Gate (M1.5)
-
-| Verification Check | Target Requirement | Measured Value | Result |
-| :--- | :--- | :--- | :--- |
-| **Finding Provenance** | $\ge 90\%$ verbatim matching | **100.0%** | **PASS** |
-| **Fetch Success Rate** | $\ge 60\%$ usable text | **100.0%** | **PASS** |
-| **Citation Resolution** | $100\%$ resolved to findings | **100.0%** | **PASS** |
-| **Report Usefulness** | $\ge 3 / 5$ useful reports | **5 / 5** | **PASS** |
-| **Execution Time** | Median wall-clock $\le 240$ s (straight-line) | **0.00 s (mock)** / **Pass** | **PASS** |
-| **Quota Feasibility** | Fits in $\le 7$ calendar days | **Confirmed** (0.4 days smoke) | **PASS** |
-
-*Documented in [`docs/DECISIONS.md`](docs/DECISIONS.md).*
-
----
-
-## System Architecture
-
-```text
-               User Query (CLI / HTTP API)
-                           │
-                           ▼
-             ┌───────────────────────────┐
-             │  FastAPI Admission Gate   │ ◄── Checks daily quota allowance
-             └─────────────┬─────────────┘
-                           │
-                           ▼
-                  [ Redis Run Queue ]
-                           │
-                           ▼
-            ┌─────────────────────────────┐
-            │   Autonomous Worker Daemon   │ ◄── Atomic Lua Lease & Generation Bump
-            └──────────────┬──────────────┘
-                           │
-  ┌────────────────────────┴────────────────────────┐
-  │         LangGraph Stateful Orchestration        │
-  │                                                 │
-  │  1. Planner Agent                               │
-  │     └─► Decomposes topic into sub-questions     │
-  │                                                 │
-  │  2. Parallel Researcher                         │
-  │     ├─► Tavily / DuckDuckGo search queries      │
-  │     ├─► Trafilatura web content fetcher         │
-  │     ├─► BM25Okapi passage ranking               │
-  │     └─► Verbatim string extraction & validation │
-  │                                                 │
-  │  3. Supervisor Reviewer                         │
-  │     └─► Evaluates evidence depth & triggers     │
-  │         bounded rework loops if needed          │
-  │                                                 │
-  │  4. Writer Agent                                │
-  │     └─► Drafts structured Markdown report       │
-  │                                                 │
-  │  5. Citation Validator                          │
-  │     └─► Audits 100% claim grounding             │
-  └────────────────────────┬────────────────────────┘
-                           │
-             ┌─────────────┴─────────────┐
-             │ Durable Checkpoint Commit │ ◄── LangGraph RedisSaver + advance_commit.lua
-             └─────────────┬─────────────┘
-                           │
-                           ▼
-             Report Result Display / Stream
-             (1. Answer Panel)
-             (2. Verified Citations Panel)
-             (3. Schema & Integrity Audit Panel)
+    Researcher --> Search[Tavily or DuckDuckGo]
+    Search --> Fetch[Trafilatura page extraction]
+    Fetch --> Rank[BM25 passage ranking]
+    Rank --> Evidence[Verbatim evidence extraction]
+    Worker --> Research
+    Research --> Checkpoint[(Redis checkpoint)]
+    Validator --> Report[Answer, citations, integrity audit]
+    Research -.-> Trace[SSE stream and append-only trace]
 ```
 
-*For complete architectural mechanics, see [`docs/architecture.md`](docs/architecture.md).*
+For implementation details, see [System Architecture](docs/architecture.md).
 
----
+## Core Engineering Design
 
-## Quick Start
+### Durable execution and worker fencing
 
-### 1. Prerequisites
-- **Python**: 3.12 recommended (compatible with 3.11–3.12)
-- **uv**: Fast Python package manager ([installation guide](https://github.com/astral-sh/uv))
-- **Redis**: 7.0+ with AOF enabled (via local installation or Docker)
+Run ownership is coordinated through Lua scripts in `src/scout/store/`:
 
-### 2. Clone and Install Dependencies
+- `acquire_lease.lua` grants exclusive run ownership and increments a generation counter.
+- `renew_lease.lua` renews ownership while the worker remains active.
+- `advance_commit.lua` permits checkpoint advancement only when the worker still holds the current generation.
+
+If a worker fails or stalls, another worker can acquire the run and continue from the latest committed checkpoint. If the original worker later resumes, the generation check prevents it from committing stale state. Network side effects are tracked through the effect journal in `src/scout/effects/`, which also supports fault injection in tests.
+
+### Resource-budget enforcement
+
+Scout tracks usage in Redis ledgers across five dimensions:
+
+- Wall-clock execution time
+- Number of LLM calls
+- Input and output tokens
+- Search queries
+- Page fetches
+
+Admission control checks the daily allowance before accepting a run. During execution, the orchestrator enforces per-run limits. When a run reaches a configured limit, Scout can synthesize a partial report from the evidence already collected rather than continuing unbounded work.
+
+### Citation and provenance validation
+
+- Extracted findings must match the fetched page text verbatim.
+- Final reports must conform to the Pydantic `ReportSchema v1`.
+- Citations must resolve to stored findings before a report is published.
+
+These checks validate whether a report's claims are grounded in the text Scout retrieved. They do not independently prove that a source is accurate, unbiased, or authoritative.
+
+### Observability
+
+Scout records model calls, tool calls, execution steps, and latency measurements in an ordered trace. The API streams progress using Server-Sent Events, including reconnect support with `Last-Event-ID`.
+
+## Features
+
+- **Crash-resilient runs:** Redis persistence and LangGraph checkpointing support recovery from interruptions.
+- **Worker coordination:** Lua leases and generation counters protect run ownership and checkpoint commits.
+- **Bounded resource use:** Admission control and in-flight ledgers enforce configured execution budgets.
+- **Evidence-grounded reporting:** Findings are checked against retrieved page text and citations are validated before publication.
+- **Live progress:** SSE streaming provides updates while a run is executing.
+- **Trace inspection:** CLI and API commands expose run status, budget usage, execution steps, and latencies.
+- **Two interfaces:** A Rich-based CLI and a REST API support interactive and programmatic use.
+
+## Evaluation Results
+
+The project includes an evaluation suite in [`data/eval_questions.jsonl`](data/eval_questions.jsonl). The following figures are reported in the repository's preliminary evaluation documents; reproduce the evaluation in your own environment before using them as a current benchmark.
+
+### End-to-end performance
+
+| Metric | Reported result | Target |
+|---|---:|---:|
+| Citation resolution rate | 100.0% | 100.0% |
+| Verbatim snippet provenance | 100.0% | At least 90.0% |
+| Mean LLM calls per run | 9.5 | At most 40 |
+| Mean searches per run | 5.0 | At most 12 |
+| Mean page fetches per run | 7.5 | At most 18 |
+| Median wall-clock latency (p50) | 483.0 seconds | At most 300 seconds |
+| p95 wall-clock latency | 577.2 seconds | Observed |
+
+The reported median latency is above the target. The evaluation notes attribute latency to queuing and rate limiting on free-tier providers.
+
+### Planner evaluation
+
+The planner rubric was evaluated over 10 complex questions and 30 generated sub-questions.
+
+| Metric | Reported score | Threshold |
+|---|---:|---:|
+| Sub-question specificity | 4.67 / 5 | At least 4.0 / 5 |
+| Sub-question independence | 5.00 / 5 | At least 4.0 / 5 |
+
+### Thin-slice acceptance checks
+
+| Check | Target | Reported result |
+|---|---|---|
+| Finding provenance | At least 90% verbatim matching | 100.0% |
+| Fetch success | At least 60% usable text | 100.0% |
+| Citation resolution | 100% resolved | 100.0% |
+| Report usefulness | At least 3 of 5 reports useful | 5 of 5 |
+| Quota feasibility | Within 7 calendar days | Confirmed for the reported smoke run |
+
+Detailed results and methodology are available in [Preliminary Evaluation](docs/preliminary_eval.md), [Planner Evaluation](docs/planner_eval.md), [Quota Reconnaissance](docs/quota_recon.md), and [Evaluation Decisions](docs/DECISIONS.md).
+
+## Getting Started
+
+### Prerequisites
+
+- Python 3.11 or 3.12 (Python 3.12 recommended)
+- [uv](https://docs.astral.sh/uv/) for Python environment and dependency management
+- Redis 7 or later, with append-only file (AOF) persistence enabled
+- An OpenRouter API key for model access
+- A Tavily API key if using Tavily search
+
+DuckDuckGo is also supported by the search integration. Model selection, quotas, budgets, and timeouts are defined in [`config/settings.yaml`](config/settings.yaml).
+
+### 1. Clone the repository
+
 ```bash
 git clone https://github.com/Git-Kapish/Scout.git
 cd Scout
-
-# Install dependencies using uv
 uv sync
 ```
 
-### 3. Start Redis
-Using the bundled Docker Compose setup:
+### 2. Start Redis
+
+Use the repository's Docker Compose configuration:
+
 ```bash
 docker compose up -d
 ```
-*Or ensure a local Redis instance is running at `127.0.0.1:6379`.*
 
-### 4. Configure Environment
-Copy the example environment file and set your API keys:
+Alternatively, run Redis locally and make it available at the address configured for Scout.
+
+### 3. Configure environment variables
+
+Copy the example environment file:
+
 ```bash
 cp .env.example .env
 ```
-Edit `.env`:
+
+Set the required values in `.env`:
+
 ```ini
 OPENROUTER_API_KEY=your_openrouter_api_key
 TAVILY_API_KEY=your_tavily_api_key
 REDIS_URL=redis://127.0.0.1:6379/0
 SCOUT_MODE=live
 ```
-*(Tavily provides 1,000 free searches/month. OpenRouter provides free model access to `minimax/minimax-m3.1-flash:free` or `nvidia/nemotron-3.5-super-vl:free` with zero credit balance).*
 
-### 5. Launch Background Services
-In terminal 1, start the FastAPI server:
+Keep API keys out of source control. Provider free-tier availability and quotas can change; check provider dashboards before running large workloads.
+
+### 4. Start the API and worker
+
+Start the API server in one terminal:
+
 ```bash
 uv run uvicorn scout.api.main:app --port 8000 --reload
 ```
 
-In terminal 2, start the autonomous research worker daemon:
+Start the worker in a second terminal:
+
 ```bash
 uv run scout worker
 ```
 
----
-
 ## CLI Usage
 
-Scout includes an interactive CLI for running research queries, inspecting runs, and monitoring agents.
+### Interactive research shell
 
-### Interactive Research Shell
-Run Scout with no arguments to launch the interactive prompt:
+Launch the interactive shell:
+
 ```bash
 uv run scout
 ```
-```text
-┌───────────────────────────────── Scout CLI ─────────────────────────────────┐
-│  🔭 Scout Interactive Research Assistant                                    │
-│  Ask any research question. Scout executes multi-agent planning, web search,│
-│  evidence extraction, and synthesis to provide a real answer, followed by   │
-│  verified citations and validation integrity checks.                        │
-│                                                                             │
-│  Commands: Type your query and hit Enter. Type 'exit' or 'quit' to exit.    │
-└─────────────────────────────────────────────────────────────────────────────┘
 
-Scout [Ask]: Compare the performance trade-offs between Redis and SQLite
-```
+### Submit a single query
 
-### Single-Shot Query
-Execute a single query directly from the shell:
 ```bash
 uv run scout ask "What are the trade-offs between Redis and SQLite?"
 ```
 
-### CLI Command Reference
+### Command reference
 
 | Command | Description |
 |---|---|
-| `scout` / `scout ask` | Launch interactive research assistant shell |
-| `scout ask "<query>"` | Submit research question and stream real-time results |
-| `scout run "<query>"` | Submit research question to API and stream SSE progress |
-| `scout watch <run_id>` | Stream real-time events from an ongoing run |
-| `scout status <run_id>` | Display current run status, budget metrics, and rendered report |
-| `scout trace <run_id>` | View ordered chronological execution steps and tool latencies |
-| `scout cancel <run_id>` | Cooperatively cancel an active research run |
-| `scout resume <run_id>` | Resume a stalled or interrupted run from its last checkpoint |
-| `scout runs list` | List active, completed, and stalled runs in Redis |
-| `scout runs purge` | Clean up unleased or stalled runs from the active registry |
-| `scout worker` | Start background research worker daemon |
+| `uv run scout` | Open the interactive research shell |
+| `uv run scout ask "<query>"` | Submit a question and stream results |
+| `uv run scout run "<query>"` | Submit a question to the API and stream SSE progress |
+| `uv run scout watch <run_id>` | Stream events from an active run |
+| `uv run scout status <run_id>` | View run status, budget usage, and the rendered report |
+| `uv run scout trace <run_id>` | Inspect ordered execution steps and latencies |
+| `uv run scout cancel <run_id>` | Request cancellation of an active run |
+| `uv run scout resume <run_id>` | Resume a stalled or interrupted run |
+| `uv run scout runs list` | List active, completed, and stalled runs |
+| `uv run scout runs purge` | Remove unleased or stalled runs from the active registry |
+| `uv run scout worker` | Start the background worker daemon |
 
-*For in-depth usage details, see [`docs/cli_and_api_guide.md`](docs/cli_and_api_guide.md).*
+See the [CLI and API Guide](docs/cli_and_api_guide.md) for additional usage details.
 
----
+## REST API
 
-## REST API Reference
-
-The FastAPI service exposes the following endpoints:
+The FastAPI application exposes the following endpoints:
 
 | Method | Endpoint | Description |
 |---|---|---|
-| `POST` | `/research` | Submit research run with admission control and idempotency |
-| `GET` | `/research/{run_id}` | Retrieve status, budget usage, and final Markdown report |
-| `GET` | `/research/{run_id}/events` | Real-time SSE stream with reconnect support (`Last-Event-ID`) |
-| `POST` | `/research/{run_id}/cancel` | Cooperatively cancel an active run |
+| `POST` | `/research` | Submit a research run with admission control and idempotency |
+| `GET` | `/research/{run_id}` | Retrieve status, budget usage, and the final Markdown report |
+| `GET` | `/research/{run_id}/events` | Stream progress using SSE, with reconnect support |
+| `POST` | `/research/{run_id}/cancel` | Request cancellation of an active run |
 | `POST` | `/research/{run_id}/resume` | Resume a stalled run under a renewed lease |
-| `GET` | `/research/{run_id}/trace` | Retrieve ordered step trace log and latencies |
-| `GET` | `/health` | Check health of Redis, search providers, and LLM backends |
+| `GET` | `/research/{run_id}/trace` | Retrieve the execution trace and latency data |
+| `GET` | `/health` | Check the configured Redis, search, and LLM dependencies |
 
-### Example Query via `curl`
+### Example request
+
+Submit a research question:
+
 ```bash
-# Submit research run
 curl -X POST http://127.0.0.1:8000/research \
   -H "Content-Type: application/json" \
   -d '{"question": "Compare the performance trade-offs between Redis and SQLite"}'
+```
 
-# Stream events in real-time
+Stream progress using the returned run ID:
+
+```bash
 curl -N http://127.0.0.1:8000/research/<RUN_ID>/events
 ```
 
----
+## Testing and Evaluation
 
-## Testing & Quality Assurance
-
-Scout includes a comprehensive test suite of unit and integration tests:
+Run the test suite:
 
 ```bash
-# Run all unit and integration tests
 uv run pytest -q
-
-# Run CLI tests specifically
-uv run pytest tests/test_cli.py
-
-# Run citation validator tests
-uv run pytest tests/test_citation_validator.py
-
-# Run resilience and lease fencing tests
-uv run pytest tests/test_fencing_lua.py
 ```
 
-### Reproducing Benchmark Evaluations
+Useful focused test commands:
+
 ```bash
-# Run provider quota reconnaissance
+uv run pytest tests/test_citation_validator.py
+uv run pytest tests/test_fencing_lua.py
+uv run pytest tests/test_cli.py
+```
+
+Reproduce the evaluation scripts:
+
+```bash
+# Inspect provider quotas
 uv run python scripts/quota_recon.py
 
-# Run planner isolation evaluation (rubric scoring)
+# Evaluate planner quality
 uv run python scripts/eval_planner.py
 
-# Run end-to-end evaluation benchmark
+# Run the end-to-end evaluation
 uv run python scripts/run_eval.py
 ```
 
----
+The repository documentation describes 75+ unit and integration tests. Run the commands above to establish the current result in your environment.
 
-## Project Structure
+## Repository Structure
 
 ```text
 Scout/
 ├── config/
-│   └── settings.yaml            # Central configuration (models, budgets, timeouts)
-├── data/
-│   ├── eval_questions.jsonl     # Benchmark evaluation questions suite
-│   ├── cache/                   # Local HTTP search & page cache
-│   └── runs/                    # Snapshot replay archives
-├── docs/
-│   ├── architecture.md          # In-depth architectural & state mechanics
-│   ├── cli_and_api_guide.md     # Complete developer & CLI guide
-│   ├── DECISIONS.md             # Milestone gates & quota arithmetic
-│   ├── planner_eval.md          # Planner evaluation rubric scores
-│   ├── preliminary_eval.md      # Baseline empirical results
-│   └── quota_recon.md           # Provider quota reconnaissance report
-├── results/
-│   └── preliminary_eval.json    # Machine-readable evaluation metrics
-├── scripts/
-│   ├── eval_planner.py          # Planner rubric evaluation script
-│   ├── quota_recon.py           # Provider quota probe & header analyzer
-│   ├── run_eval.py              # End-to-end benchmark evaluation runner
-│   └── thin_slice.py            # Vertical slice straight-line pipeline
+│   └── settings.yaml       # Models, budgets, and timeouts
+├── data/                   # Evaluation questions, cache, and run snapshots
+├── docs/                   # Architecture, guides, decisions, and evaluation reports
+├── results/                # Machine-readable evaluation results
+├── scripts/                # Evaluation and quota-analysis utilities
 ├── src/scout/
-│   ├── agents/                  # Planner, Researcher, Reviewer, Writer agents
-│   ├── api/                     # FastAPI routes, admission control, SSE
-│   ├── effects/                 # Network effect journal & fault injection
-│   ├── extract/                 # BM25 passage ranking & verbatim matcher
-│   ├── graph/                   # LangGraph state machine & topology
-│   ├── llm/                     # OpenRouter / Groq clients & rate limiters
-│   ├── search/                  # Tavily & DuckDuckGo search wrappers
-│   ├── store/                   # Redis Lua scripts, keys, ledgers, export
-│   ├── trace/                   # Structured step trace recording
-│   ├── validate/                # Mechanical citation & schema validator
-│   ├── cli.py                   # Rich CLI entry point & interactive shell
-│   └── worker.py                # Autonomous worker daemon & lease loop
-└── tests/                       # Unit & integration test suite (75+ tests)
+│   ├── agents/             # Planner, researcher, supervisor, and writer
+│   ├── api/                # FastAPI routes, admission control, and SSE
+│   ├── effects/            # Effect journal and fault injection
+│   ├── extract/            # BM25 passage ranking and verbatim matching
+│   ├── graph/              # LangGraph workflow
+│   ├── llm/                # Model clients and rate-limit handling
+│   ├── search/              # Tavily and DuckDuckGo integrations
+│   ├── store/               # Redis Lua scripts, keys, ledgers, and export
+│   ├── trace/               # Structured execution tracing
+│   ├── validate/            # Citation and schema validation
+│   ├── cli.py               # CLI and interactive shell
+│   └── worker.py            # Background worker and lease loop
+└── tests/                   # Unit and integration tests
 ```
 
----
+## Limitations
+
+- **Latency:** Free-tier providers may queue or rate-limit requests. The reported median evaluation latency is several minutes.
+- **Provider quotas:** Search and free-model quotas constrain throughput and availability.
+- **Source quality:** Scout checks whether claims are grounded in retrieved text, but it does not establish whether that text is accurate, unbiased, or authoritative.
+- **External dependencies:** Results depend on search-provider availability, webpage accessibility, and the selected model's behavior.
+
+## Documentation
+
+| Document | Description |
+|---|---|
+| [System Architecture](docs/architecture.md) | Workflow, persistence, lease, and state mechanics |
+| [CLI and API Guide](docs/cli_and_api_guide.md) | Command-line and REST API reference |
+| [Evaluation Decisions](docs/DECISIONS.md) | Evaluation gates and quota calculations |
+| [Preliminary Evaluation](docs/preliminary_eval.md) | Reported baseline metrics |
+| [Planner Evaluation](docs/planner_eval.md) | Planner rubric and scores |
+| [Quota Reconnaissance](docs/quota_recon.md) | Provider quota investigation |
+| [Product Requirements](PRD.md) | Product goals and requirements |
 
 ## License
 
-This project is licensed under the [MIT License](LICENSE).
+Scout is released under the [MIT License](LICENSE).
