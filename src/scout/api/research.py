@@ -52,6 +52,8 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/research", tags=["Research"])
 
+RECOVERABLE_REASONS = {"worker_lost", "provider_unavailable", "quota_limited"}
+
 
 def get_redis_client() -> redis.Redis:
     settings = get_settings()
@@ -373,6 +375,18 @@ def resume_research_run(run_id: str) -> ActionResponse:
 
     meta = {_decode(k): _decode(v) for k, v in meta_raw.items()}
     status = meta.get("status", "")
+    reason = meta.get("termination_reason", "")
+
+    # Only failed runs with a recoverable reason may resume; other outcomes are immutable (PRD FR-4.4).
+    if status != "failed" or reason not in RECOVERABLE_REASONS:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "not_recoverable",
+                "message": f"Run '{run_id}' is '{status}' (reason: '{reason}'); only failed runs with "
+                f"reason in {sorted(RECOVERABLE_REASONS)} can be resumed",
+            },
+        )
 
     # Re-queue to queue:runs
     r.rpush(key_queue_runs(), run_id)

@@ -31,18 +31,6 @@ def verify_snippet_in_page(snippet: str, page_text: str) -> bool:
     norm_snippet = normalize_whitespace(snippet)
     norm_page = normalize_whitespace(page_text)
 
-    # Direct substring check
-    if norm_snippet in norm_page:
-        return True
-
-    # Case-insensitive check as secondary fallback
-    if norm_snippet.lower() in norm_page.lower():
-        return True
-
-    # Check without punctuation if model stripped or altered quotes/commas
-    clean_snippet = re.sub(r"[^\w\s]", "", norm_snippet.lower())
-    clean_page = re.sub(r"[^\w\s]", "", norm_page.lower())
-    if len(clean_snippet) > 20 and clean_snippet in clean_page:
-        return True
-
-    return False
+    # Whitespace-normalized verbatim match only (PRD §4.3 #3): looser matching lets
+    # altered figures through, e.g. "1.5 billion" vs "15 billion".
+    return norm_snippet in norm_page

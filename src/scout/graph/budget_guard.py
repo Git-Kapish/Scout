@@ -9,9 +9,10 @@ Enforces:
 from __future__ import annotations
 
 import time
-from typing import Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 from scout.config import get_settings
+from scout.effects.runtime import DispatchMeter
 from scout.graph.state import ResearchState
 
 
@@ -20,17 +21,10 @@ class BudgetBreachError(Exception):
     pass
 
 
-def check_budget_guard(state: ResearchState) -> Tuple[bool, Optional[str]]:
-    """Checks whether the run has remaining budget to initiate new external work.
-
-    Returns:
-        (can_proceed, exhaustion_reason)
-    """
-    settings = get_settings()
-    default_budgets = settings.budgets["default"]
-    hard_limits = settings.budgets["hard_limits"]
-
-    # Effective limits (user options clamped to hard limits per PRD FR-2.2)
+def effective_limits(state: ResearchState) -> Tuple[int, int]:
+    """(max_tokens, max_llm_calls): user options clamped to hard limits per PRD FR-2.2."""
+    budgets = get_settings().budgets
+    default_budgets, hard_limits = budgets["default"], budgets["hard_limits"]
     max_tokens = min(
         state.options.get("max_total_tokens") or default_budgets.total_tokens,
         hard_limits.total_tokens,
@@ -39,11 +33,29 @@ def check_budget_guard(state: ResearchState) -> Tuple[bool, Optional[str]]:
         state.options.get("max_llm_calls") or default_budgets.total_llm_calls,
         hard_limits.total_llm_calls,
     )
-    max_reworks = min(
-        default_budgets.reworks_per_run,
-        hard_limits.reworks_per_run,
-    )
+    return max_tokens, max_llm_calls
 
+
+def budget_meter(state: ResearchState) -> DispatchMeter:
+    """Meter that enforces the run caps on every dispatch inside one node."""
+    max_tokens, max_llm_calls = effective_limits(state)
+    return DispatchMeter.from_ledger(state.budget_ledger, max_llm_calls, max_tokens, state.deadline_ts)
+
+
+def budget_usage_ratio(state: ResearchState) -> float:
+    """Highest used share of the LLM-call or token budget (for the 80% budget_warning)."""
+    max_tokens, max_llm_calls = effective_limits(state)
+    ledger = state.budget_ledger
+    return max(ledger.llm_calls / max_llm_calls, (ledger.tokens_in + ledger.tokens_out) / max_tokens)
+
+
+def check_budget_guard(state: ResearchState) -> Tuple[bool, Optional[str]]:
+    """Checks whether the run has remaining budget to initiate new external work.
+
+    Returns:
+        (can_proceed, exhaustion_reason)
+    """
+    max_tokens, max_llm_calls = effective_limits(state)
     ledger = state.budget_ledger
 
     # 1. Wall-clock deadline check
@@ -59,11 +71,7 @@ def check_budget_guard(state: ResearchState) -> Tuple[bool, Optional[str]]:
     if total_tokens_used >= max_tokens:
         return False, "token_budget_exhausted"
 
-    # 4. Total reworks hard limit
-    if state.total_reworks >= max_reworks:
-        # Note: rework exhaustion does not stop the run, only further rework
-        pass
-
+    # Rework caps are enforced by the supervisor; they limit reworks, not the run.
     return True, None
 
 

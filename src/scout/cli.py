@@ -531,7 +531,8 @@ def _execute_and_display_query(question: str, api_url: str) -> None:
 def _execute_direct_local(question: str, redis_url: str = "redis://127.0.0.1:6379/0") -> None:
     import redis
     from scout.worker import ResearchWorker
-    from scout.store.redis_keys import key_run_meta, key_run_report, key_run_budget
+    from scout.store.ledgers import LedgerStore
+    from scout.store.redis_keys import key_run_meta, key_run_report
 
     r = redis.Redis.from_url(redis_url)
     run_id = f"cli_{uuid.uuid4().hex[:10]}"
@@ -542,17 +543,13 @@ def _execute_direct_local(question: str, redis_url: str = "redis://127.0.0.1:637
     try:
         final_state = worker.execute_run(run_id=run_id, initial_question=question)
         report_raw = r.get(key_run_report(run_id))
-        budget_raw = r.get(key_run_budget(run_id))
         report_dict = (
             json.loads(report_raw)
             if report_raw
-            else (final_state.get("final_report").model_dump() if final_state.get("final_report") else {})
+            else (final_state.report.model_dump() if final_state.report else {})
         )
-        budget_dict = (
-            json.loads(budget_raw)
-            if budget_raw
-            else (final_state.get("budget").model_dump() if final_state.get("budget") else {})
-        )
+        # run:{id}:budget is a hash; LedgerStore parses it into ints
+        budget_dict = LedgerStore(r).get_run_budget(run_id).model_dump()
         display_report_result(report_dict, budget=budget_dict, question=question, run_id=run_id)
     except Exception as e:
         console.print(f"[bold red]Direct execution error:[/] {e}")

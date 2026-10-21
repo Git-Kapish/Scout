@@ -404,3 +404,10 @@ def test_writer_prompt_findings_capping_with_large_finding_set():
     prompt_f_ids = re.findall(r"- ID: (f_\d+)", user_prompt)
     assert len(prompt_f_ids) <= 12
     assert len(prompt_f_ids) > 0
+
+
+def test_report_without_claims_is_invalid():
+    report = Report(title="T", summary="S", sections=[ReportSection(title="S", content="Uncited prose.", claims=[])])
+    result = validate_report_citations(report, {})
+    assert result.valid is False
+    assert "Report contains no cited claims" in result.unresolved_citations

@@ -42,6 +42,10 @@ def validate_report_citations(
             if claim_has_unresolved:
                 dropped_claims.append(claim)
 
+    # A report with no cited claims would pass vacuously (PRD FR-5.4).
+    if not any(section.claims for section in report.sections):
+        unresolved.append("Report contains no cited claims")
+
     is_valid = len(unresolved) == 0
     details = (
         "All citations resolved successfully to verified findings."

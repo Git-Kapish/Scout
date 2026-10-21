@@ -26,3 +26,9 @@ def test_verify_snippet_rejection_on_fabrication():
     page_text = "OpenRouter offers access to various open-weight models."
     fabricated_snippet = "OpenRouter offers unlimited free requests for all enterprise accounts."
     assert verify_snippet_in_page(fabricated_snippet, page_text) is False
+
+
+def test_verify_snippet_rejects_altered_figures_and_case():
+    page_text = "Revenue grew 1.5 billion in 2025."
+    assert verify_snippet_in_page("Revenue grew 15 billion in 2025.", page_text) is False
+    assert verify_snippet_in_page("revenue grew 1.5 billion", page_text) is False

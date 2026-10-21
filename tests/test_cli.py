@@ -58,3 +58,34 @@ def test_cli_subparsers_registration():
         with pytest.raises(SystemExit) as exc:
             main()
         assert exc.value.code == 0
+
+
+def test_direct_local_reads_budget_hash(monkeypatch):
+    """The direct-local fallback must read run:{id}:budget as a hash, not GET it (WRONGTYPE)."""
+    import redis
+
+    import scout.cli as cli
+    from scout.graph.state import ResearchState
+    from scout.store.redis_keys import key_run_budget
+
+    r = redis.Redis(host="127.0.0.1", port=6379, db=0)
+    captured = {}
+
+    class FakeWorker:
+        def __init__(self, **kwargs):
+            pass
+
+        def execute_run(self, run_id, initial_question):
+            r.hset(key_run_budget(run_id), mapping={"llm_calls": "3", "tokens_in": "10", "tokens_out": "5"})
+            return ResearchState(run_id=run_id, question=initial_question)
+
+    monkeypatch.setattr("scout.worker.ResearchWorker", FakeWorker)
+    monkeypatch.setattr(
+        cli, "display_report_result", lambda report, budget, question, run_id: captured.update(budget=budget, run_id=run_id)
+    )
+
+    cli._execute_direct_local("Q?")
+
+    assert captured["budget"]["llm_calls"] == 3
+    for k in r.keys(f"*{captured['run_id']}*"):
+        r.delete(k)

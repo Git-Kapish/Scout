@@ -17,10 +17,11 @@ import time
 from typing import Any, Dict, List, Optional, Tuple, Type, TypeVar
 
 import httpx
-from openai import APIStatusError, OpenAI, RateLimitError
+from openai import APIConnectionError, APIStatusError, OpenAI, RateLimitError
 from pydantic import BaseModel, ValidationError
 
 from scout.config import RoleConfig, Settings, get_settings
+from scout.effects.runtime import RUN_STOP_ERRORS, current_hooks, current_meter, external_call
 
 T = TypeVar("T", bound=BaseModel)
 
@@ -65,14 +66,11 @@ class LLMClient:
         p_cfg = self.settings.providers[provider_name]
         api_key = self._get_api_key(p_cfg.env_key)
         if not api_key:
-            # Check for dummy / mock mode if not live
-            if self.settings.scout_mode in ("record", "replay"):
-                api_key = "test-key"
-            else:
-                raise ValueError(
-                    f"Missing API key for provider '{provider_name}'. "
-                    f"Please set environment variable '{p_cfg.env_key}' in .env."
-                )
+            # Replay never reaches here on a cache hit; a miss must fail closed, not dispatch (PRD FR-6.2a).
+            raise ValueError(
+                f"Missing API key for provider '{provider_name}'. "
+                f"Please set environment variable '{p_cfg.env_key}' in .env."
+            )
 
         client = OpenAI(
             base_url=p_cfg.base_url,
@@ -121,7 +119,10 @@ class LLMClient:
                     response_model=response_model,
                     max_retries=max_retries,
                     prompt_est=prompt_est,
+                    step=role,
                 )
+            except RUN_STOP_ERRORS:
+                raise
             except (RateLimitError, APIStatusError) as e:
                 # 429 or quota errors trigger provider chain fallback (PRD FR-3.4)
                 status_code = getattr(e, "status_code", None)
@@ -135,7 +136,42 @@ class LLMClient:
 
         raise ProviderQuotaExhaustedError(
             f"All providers in chain for role '{role}' failed. Last error: {last_error}"
-        )
+        ) from last_error
+
+    def _complete(self, role_cfg: RoleConfig, completion_kwargs: Dict[str, Any], step: str) -> Dict[str, Any]:
+        """One metered, journaled completion; returns plain data so it can be cached and replayed."""
+        meter = current_meter()
+        reservation = self.estimate_prompt_tokens(completion_kwargs["messages"]) + role_cfg.max_tokens
+        if meter:
+            meter.reserve_llm(reservation)
+
+        def dispatch() -> Dict[str, Any]:
+            client, _ = self._create_client(role_cfg.provider)
+            hooks = current_hooks()
+            hooks.record_provider_usage(role_cfg.provider, 1, 0)
+            try:
+                resp = client.chat.completions.create(**completion_kwargs)
+            except APIStatusError as err:
+                if "response_format" not in completion_kwargs or "response_format" not in str(err).lower():
+                    raise
+                if meter:
+                    meter.reserve_llm(reservation)
+                hooks.record_provider_usage(role_cfg.provider, 1, 0)
+                resp = client.chat.completions.create(
+                    **{k: v for k, v in completion_kwargs.items() if k != "response_format"}
+                )
+            usage = None
+            if resp.usage:
+                usage = {
+                    "prompt_tokens": resp.usage.prompt_tokens,
+                    "completion_tokens": resp.usage.completion_tokens,
+                    "total_tokens": resp.usage.total_tokens,
+                }
+                hooks.record_provider_usage(role_cfg.provider, 0, resp.usage.total_tokens or 0)
+            return {"content": resp.choices[0].message.content or "", "usage": usage}
+
+        inputs = {"provider": role_cfg.provider, **{k: v for k, v in completion_kwargs.items() if k != "extra_headers"}}
+        return external_call("llm", step, inputs, dispatch, dict, dict)
 
     def _dispatch_with_retries(
         self,
@@ -144,8 +180,8 @@ class LLMClient:
         response_model: Optional[Type[T]],
         max_retries: int,
         prompt_est: int,
+        step: str = "llm",
     ) -> LLMResponse:
-        client, _ = self._create_client(role_cfg.provider)
         current_messages = list(messages)
         attempt = 0
 
@@ -168,26 +204,17 @@ class LLMClient:
             }
             completion_kwargs["extra_headers"] = extra_headers
 
-            try:
-                resp = client.chat.completions.create(**completion_kwargs)
-            except APIStatusError as err:
-                if "response_format" in completion_kwargs and "response_format" in str(err).lower():
-                    completion_kwargs.pop("response_format", None)
-                    resp = client.chat.completions.create(**completion_kwargs)
-                else:
-                    raise
-
+            raw = self._complete(role_cfg, completion_kwargs, step)
             latency = time.time() - start_time
-
-            choice = resp.choices[0]
-            content = choice.message.content or ""
+            content = raw["content"]
 
             # Extract usage
-            if resp.usage:
+            reported = raw["usage"]
+            if reported:
                 usage = LLMUsage(
-                    prompt_tokens=resp.usage.prompt_tokens or prompt_est,
-                    completion_tokens=resp.usage.completion_tokens or 0,
-                    total_tokens=resp.usage.total_tokens or (prompt_est + (resp.usage.completion_tokens or 0)),
+                    prompt_tokens=reported["prompt_tokens"] or prompt_est,
+                    completion_tokens=reported["completion_tokens"] or 0,
+                    total_tokens=reported["total_tokens"] or (prompt_est + (reported["completion_tokens"] or 0)),
                     is_estimated=False,
                 )
             else:
@@ -199,6 +226,9 @@ class LLMClient:
                     total_tokens=prompt_est + comp_est,
                     is_estimated=True,
                 )
+            meter = current_meter()
+            if meter:
+                meter.record_usage(usage.prompt_tokens, usage.completion_tokens, usage.is_estimated)
 
             # Early detection of empty responses from free-tier models (timeout / rate limit)
             if response_model is not None and not content.strip():
@@ -299,3 +329,13 @@ class LLMClient:
             raise jde
 
         return model_cls.model_validate(data)
+
+
+def classify_provider_failure(exc: BaseException) -> Optional[str]:
+    """Maps a provider failure that escaped a node to a recoverable termination reason (PRD FR-4.4)."""
+    for err in (exc, exc.__cause__):
+        if getattr(err, "status_code", None) in (402, 429):
+            return "quota_limited"
+    if isinstance(exc, (ProviderQuotaExhaustedError, APIStatusError, APIConnectionError)):
+        return "provider_unavailable"
+    return None

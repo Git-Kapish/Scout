@@ -21,9 +21,14 @@ from typing import Any, Dict, List, Optional
 import redis
 from langgraph.checkpoint.redis import RedisSaver
 
+from scout.config import get_settings
 from scout.effects.fault_injection import maybe_crash
+from scout.effects.journal import EffectJournal
+from scout.effects.recorder import ReplayMissError
+from scout.effects.runtime import RunHooks, run_hooks
 from scout.graph.builder import create_research_graph
 from scout.graph.state import ResearchState
+from scout.llm.client import classify_provider_failure
 from scout.store.export import RunExporter
 from scout.store.ledgers import LedgerStore
 from scout.store.lua_scripts import ScriptRegistry
@@ -111,6 +116,21 @@ class ResearchWorker:
         self._heartbeat_threads[run_id] = t
         t.start()
 
+    def _run_hooks(self, run_id: str) -> RunHooks:
+        """Wires agent calls to this run's cancellation flag, provider ledger and effect journal."""
+        meta_k = key_run_meta(run_id)
+        journal = EffectJournal(self.r)
+        policy = get_settings().effects.read_only_ambiguity_policy
+        return RunHooks(
+            is_cancelled=lambda: self.r.hget(meta_k, "cancellation_requested") == b"1",
+            record_provider_usage=lambda provider, requests, tokens: self.ledgers.record_provider_usage(
+                provider, requests=requests, tokens=tokens
+            ),
+            run_effect=lambda step, effect_type, inputs, dispatch, ser, deser: journal.execute_durable(
+                run_id, step, effect_type, inputs, dispatch, ser, deser, ambiguity_policy=policy
+            )[0],
+        )
+
     def stop_heartbeat(self, run_id: str) -> None:
         """Stops the background heartbeat loop."""
         stop_event = self._heartbeat_stop_events.pop(run_id, None)
@@ -161,7 +181,7 @@ class ResearchWorker:
         self.start_heartbeat(run_id, generation)
 
         try:
-            with RedisSaver.from_conn_string(self.redis_url) as checkpointer:
+            with RedisSaver.from_conn_string(self.redis_url) as checkpointer, run_hooks(self._run_hooks(run_id)):
                 checkpointer.setup()
                 app = create_research_graph(
                     planner_agent=planner_agent,
@@ -192,6 +212,7 @@ class ResearchWorker:
                         }
                     }
                     input_state = None
+                    self.registry.fenced_hset(gen_k, meta_k, generation, {"status": "running", "termination_reason": ""})
                 else:
                     logger.info("Starting FRESH run '%s'", run_id)
                     config = {"configurable": {"thread_id": run_id}}
@@ -223,26 +244,25 @@ class ResearchWorker:
 
                 # Execute graph node-by-node via stream
                 last_state: Optional[ResearchState] = None
+                last_cid = committed_data.get("checkpoint_id") if committed_data else None
+                pending_update: Optional[Dict[str, Any]] = None
                 try:
-                    for update in app.stream(input_state, config=config, stream_mode="updates"):
-                        # update is a dict: {node_name: {changed_state_keys...}}
+                    # durability="sync": each checkpoint is persisted before its event reaches us.
+                    for mode, chunk in app.stream(
+                        input_state, config=config, stream_mode=["updates", "checkpoints"], durability="sync"
+                    ):
+                        if mode == "updates":
+                            pending_update = chunk  # {node_name: {changed_state_keys...}}
+                            continue
+                        if pending_update is None:
+                            continue  # input checkpoint: no node output to commit
+                        update, pending_update = pending_update, None
                         node_name = next(iter(update.keys())) if update else "unknown"
                         current_seq += 1
 
-                        # Get latest saved checkpoint from state snapshot (synchronous & reliable)
-                        st_snapshot = app.get_state({"configurable": {"thread_id": run_id}})
-                        latest_cid = (
-                            st_snapshot.config.get("configurable", {}).get("checkpoint_id")
-                            if st_snapshot and st_snapshot.config
-                            else None
-                        )
-                        if not latest_cid:
-                            tup = checkpointer.get_tuple({"configurable": {"thread_id": run_id}})
-                            latest_cid = tup.checkpoint["id"] if tup and tup.checkpoint else None
-
-                        if not latest_cid or latest_cid == "unknown_cid":
-                            logger.debug("Skipping commit pointer advancement for uncheckpointed node: %s", node_name)
-                            continue
+                        # Commit this step's own checkpoint, never the thread's latest: a stale worker
+                        # may have written newer library checkpoints for the same thread (PRD FR-4.1).
+                        latest_cid = chunk["config"]["configurable"]["checkpoint_id"]
 
                         # Crash hook 5: after_checkpoint_before_commit
                         maybe_crash("after_checkpoint_before_commit")
@@ -278,13 +298,17 @@ class ResearchWorker:
                                 logger.warning(
                                     "Commit pointer advancement rejected: %s", commit_reason
                                 )
+                        else:
+                            last_cid = latest_cid
 
                         # Fenced sync of application read-model
                         node_output = update[node_name]
                         self._sync_read_model(run_id, generation, node_name, node_output)
 
-                    # Final state retrieval (query latest without pinning checkpoint_id)
+                    # Final state comes from the last committed checkpoint, not the thread's latest
                     final_config = {"configurable": {"thread_id": run_id}}
+                    if last_cid:
+                        final_config["configurable"]["checkpoint_id"] = last_cid
                     final_snapshot = app.get_state(final_config)
                     if final_snapshot and final_snapshot.values:
                         last_state = ResearchState.model_validate(final_snapshot.values)
@@ -325,6 +349,12 @@ class ResearchWorker:
 
                 except Exception as exc:
                     logger.error("Run %s encountered unhandled error during execution: %s", run_id, exc)
+                    # Provider and replay failures are structured reasons; quota_limited and
+                    # provider_unavailable stay resumable from the last committed checkpoint (FR-4.4).
+                    if isinstance(exc, ReplayMissError):
+                        reason = "replay_miss"
+                    else:
+                        reason = classify_provider_failure(exc) or "unhandled_error"
                     self.registry.fenced_hset(
                         gen_k,
                         meta_k,
@@ -332,7 +362,8 @@ class ResearchWorker:
                         {
                             "status": "failed",
                             "completed_at_ts": str(time.time()),
-                            "termination_reason": f"unhandled_error: {str(exc)[:100]}",
+                            "termination_reason": reason,
+                            "termination_detail": str(exc)[:200],
                         },
                     )
                     self.exporter.export_run(run_id)
@@ -400,6 +431,18 @@ class ResearchWorker:
             generation,
             {"event": "node_completed", "node": node_name, "timestamp": str(time.time())},
         )
+        # Budget events (PRD FR-2.2): pick_next flags the 80% warning and reports guard stops.
+        if node_output.get("budget_warning_emitted"):
+            self.registry.fenced_xadd(
+                gen_k, events_k, generation, {"event": "budget_warning", "timestamp": str(time.time())}
+            )
+        if node_output.get("termination_reason") in ("wall_clock_timeout", "llm_calls_exhausted", "token_budget_exhausted"):
+            self.registry.fenced_xadd(
+                gen_k,
+                events_k,
+                generation,
+                {"event": "budget_exhausted", "reason": node_output["termination_reason"], "timestamp": str(time.time())},
+            )
 
         # 5. Emit structured trace entry (PRD FR-5.5)
         step_kind = "decision"

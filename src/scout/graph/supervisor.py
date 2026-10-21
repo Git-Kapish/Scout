@@ -12,6 +12,7 @@ import logging
 from typing import List, Optional
 
 from scout.config import get_settings
+from scout.effects.recorder import ReplayMissError
 from scout.graph.state import ResearchState
 from scout.llm import LLMClient
 from scout.schemas import Finding, ReviewDecision, SubQuestion
@@ -138,7 +139,10 @@ class SupervisorReviewer:
 
             return decision
 
+        except ReplayMissError:
+            raise
         except Exception as e:
+            # Budget/cancel stops land here too: the deterministic fallback needs no LLM call.
             logger.error("Supervisor LLM review failed: %s. Falling back to deterministic decision.", e)
             if subq_findings:
                 return ReviewDecision(
