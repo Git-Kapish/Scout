@@ -415,3 +415,114 @@ def test_adversarial_budget_limits_respected():
     assert final_state["budget_ledger"].llm_calls <= 2
     assert final_state["status"] == "failed"
     assert final_state["termination_reason"] in ("llm_calls_exhausted", "insufficient_evidence")
+
+
+def _two_subq_harness():
+    subqs = [
+        SubQuestion(id="sq_1", question="What is A?", rationale="r1"),
+        SubQuestion(id="sq_2", question="What is B?", rationale="r2"),
+    ]
+    pages = {
+        "https://test.org/page1": "Page 1 contains key fact alpha verified verbatim.",
+        "https://test2.org/page2": "Page 2 contains key fact beta verified verbatim.",
+    }
+    candidates = [
+        CandidateFinding(claim="Fact alpha", snippet="key fact alpha verified verbatim"),
+        CandidateFinding(claim="Fact beta", snippet="key fact beta verified verbatim"),
+    ]
+    return build_mock_harness(subquestions=subqs, research_pages=pages, candidate_findings=candidates)
+
+
+def test_exhausted_regenerations_finalize_without_looping():
+    """A writer that keeps citing an unknown ID gets max_regenerations retries, then is pruned and finalized."""
+    from scout.config import get_settings
+    from scout.schemas import Report, ReportSection
+
+    planner, researcher, supervisor, writer = _two_subq_harness()
+
+    def bad_writer(question, plan, findings, **kwargs):
+        claims = [Claim(text=f"Claim {f.finding_id}", finding_ids=[f.finding_id]) for f in findings]
+        claims.append(Claim(text="Bogus claim", finding_ids=["f_bogus"]))
+        return Report(title="R", summary="S", sections=[ReportSection(title="S1", content="Prose", claims=claims)])
+
+    writer.write = MagicMock(side_effect=bad_writer)
+    app = create_research_graph(
+        planner_agent=planner, researcher_agent=researcher, writer_agent=writer, supervisor_reviewer=supervisor
+    )
+
+    final_state = app.invoke(ResearchState(run_id="run_regen_exhausted", question="A and B?"))
+
+    max_regen = get_settings().budgets["default"].writer_regenerations
+    assert writer.write.call_count == max_regen + 1
+    assert final_state["status"] == "completed_partial"
+    claims = [c for s in final_state["report"].sections for c in s.claims]
+    assert not any("f_bogus" in c.finding_ids for c in claims)
+    assert final_state["report"].sections[0].content == ""  # prose could restate the dropped claim
+
+
+def test_topology_cancellation_mid_run():
+    """Cancellation requested while research runs stops before review, writing or further research."""
+    from scout.effects.runtime import RunHooks, run_hooks
+    from scout.schemas import ResearchResult
+
+    planner, researcher, supervisor, writer = _two_subq_harness()
+    flag = {"cancel": False}
+
+    def research_then_cancel(sq, **kwargs):
+        flag["cancel"] = True  # cancel arrives while this sub-question is in flight
+        return ResearchResult(subquestion_id=sq.id, status="ok"), []
+
+    researcher.execute_subquestion = MagicMock(side_effect=research_then_cancel)
+    supervisor.review = MagicMock()
+    writer.write = MagicMock()
+    app = create_research_graph(
+        planner_agent=planner, researcher_agent=researcher, writer_agent=writer, supervisor_reviewer=supervisor
+    )
+
+    with run_hooks(RunHooks(is_cancelled=lambda: flag["cancel"])):
+        final_state = app.invoke(ResearchState(run_id="run_cancel_mid", question="A and B?"))
+
+    assert final_state["status"] == "cancelled"
+    assert researcher.execute_subquestion.call_count == 1
+    supervisor.review.assert_not_called()
+    writer.write.assert_not_called()
+
+
+def test_accepted_findings_exclude_abandoned_subquestions():
+    def finding(fid, sq_id, domain):
+        return Finding(
+            finding_id=fid, subquestion_id=sq_id, claim="C", snippet="S",
+            source_url=f"https://{domain}", domain=domain, page_hash="h", verified=True,
+        )
+
+    state = ResearchState(
+        findings=[finding("f1", "sq_1", "a.org"), finding("f2", "sq_2", "b.org")],
+        completed_subquestion_ids=["sq_1"],
+        abandoned_subquestion_ids=["sq_2"],
+    )
+    assert [f.finding_id for f in state.get_accepted_findings()] == ["f1"]
+    assert state.get_distinct_domains() == ["a.org"]
+
+
+def test_wall_clock_override_clamped_to_hard_limit():
+    from scout.config import get_settings
+    from scout.graph.nodes import init_run_node
+
+    hard = get_settings().budgets["hard_limits"].wall_clock_s
+    update = init_run_node(ResearchState(options={"wall_clock_s": hard + 900}))
+    assert update["deadline_ts"] - update["started_at_ts"] <= hard + 1
+
+
+def test_rework_hint_reaches_query_prompt_and_finding_ids_are_stable():
+    planner, researcher, supervisor, writer = _two_subq_harness()
+    sq = SubQuestion(id="sq_1", question="What is A?", rationale="r1")
+
+    _, first = researcher.execute_subquestion(sq)
+    _, second = researcher.execute_subquestion(sq, reformulation_hint="try vendor docs")
+
+    assert first and [f.finding_id for f in first] == [f.finding_id for f in second]
+    query_calls = [
+        c for c in researcher.llm_client.generate.call_args_list
+        if c.kwargs.get("response_model") is QueryGenerationOutput
+    ]
+    assert "try vendor docs" in query_calls[-1].kwargs["messages"][0]["content"]

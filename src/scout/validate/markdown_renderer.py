@@ -71,7 +71,9 @@ def render_markdown_report(
         lines.append("")
 
     # References / Bibliography
+    # Each reference is its own block (blank-line separated) so renderers don't merge them into one paragraph
     lines.append("## References")
+    lines.append("")
     if citation_map:
         sorted_citations = sorted(citation_map.items(), key=lambda x: x[1])
         for fid, num in sorted_citations:
@@ -87,10 +89,11 @@ def render_markdown_report(
                     f"[{num}] **{source_title}** - [{finding.source_url}]({finding.source_url}) "
                     f"(Retrieved {retrieved_str})"
                 )
-                lines.append(f"    *Quote: \"{finding.snippet}\"*")
+                lines.append(f"> *Quote: \"{finding.snippet}\"*")
             else:
                 lines.append(f"[{num}] Finding ID: {fid}")
+            lines.append("")
     else:
         lines.append("No citations recorded.")
 
-    return "\n".join(lines)
+    return "\n".join(lines).rstrip()

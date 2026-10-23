@@ -259,7 +259,7 @@ def test_resume_research_run(client, redis_client):
     run_id = f"test_resume_{uuid.uuid4().hex[:8]}"
     redis_client.hset(
         key_run_meta(run_id),
-        mapping={"run_id": run_id, "status": "failed", "question": "Resume test"},
+        mapping={"run_id": run_id, "status": "failed", "termination_reason": "quota_limited", "question": "Resume test"},
     )
 
     resp = client.post(f"/research/{run_id}/resume")
@@ -277,6 +277,28 @@ def test_resume_research_run(client, redis_client):
     for k in redis_client.keys(f"*{run_id}*"):
         redis_client.delete(k)
     redis_client.lrem(key_queue_runs(), 0, run_id)
+
+
+@pytest.mark.parametrize(
+    "status,reason",
+    [("running", ""), ("completed", ""), ("cancelled", "cancelled"), ("failed", "insufficient_evidence")],
+)
+def test_resume_rejects_non_recoverable_runs(client, redis_client, status, reason):
+    run_id = f"test_resume_reject_{uuid.uuid4().hex[:8]}"
+    redis_client.hset(
+        key_run_meta(run_id),
+        mapping={"run_id": run_id, "status": status, "termination_reason": reason, "question": "Q"},
+    )
+
+    resp = client.post(f"/research/{run_id}/resume")
+    assert resp.status_code == 409
+    assert resp.json()["detail"]["code"] == "not_recoverable"
+    # Status untouched and nothing queued
+    assert redis_client.hget(key_run_meta(run_id), "status").decode() == status
+    assert run_id.encode() not in redis_client.lrange(key_queue_runs(), 0, -1)
+
+    for k in redis_client.keys(f"*{run_id}*"):
+        redis_client.delete(k)
 
 
 def test_stream_events_and_replay(client, redis_client):

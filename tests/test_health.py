@@ -11,4 +11,4 @@ def test_health_endpoint():
     assert data["status"] in ("ok", "degraded")
     assert "redis" in data
     assert "providers" in data
-    assert data["providers"]["openrouter"]["model"] == "minimax/minimax-m3.1-flash:free"
+    assert data["providers"]["openrouter"]["model"] == "poolside/laguna-s-2.1:free"

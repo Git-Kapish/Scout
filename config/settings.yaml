@@ -10,7 +10,7 @@ roles:
   planner:
     primary:
       provider: "openrouter"
-      model: "minimax/minimax-m3.1-flash:free"
+      model: "poolside/laguna-s-2.1:free"
       max_tokens: 4096
       temperature: 0.1
     fallback: null
@@ -18,7 +18,7 @@ roles:
   supervisor:
     primary:
       provider: "openrouter"
-      model: "minimax/minimax-m3.1-flash:free"
+      model: "poolside/laguna-s-2.1:free"
       max_tokens: 2048
       temperature: 0.0
     fallback: null
@@ -26,7 +26,7 @@ roles:
   researcher_query:
     primary:
       provider: "openrouter"
-      model: "minimax/minimax-m3.1-flash:free"
+      model: "poolside/laguna-s-2.1:free"
       max_tokens: 4096
       temperature: 0.2
     fallback: null
@@ -34,7 +34,7 @@ roles:
   researcher_extract:
     primary:
       provider: "openrouter"
-      model: "minimax/minimax-m3.1-flash:free"
+      model: "poolside/laguna-s-2.1:free"
       max_tokens: 4096
       temperature: 0.0
     fallback: null
@@ -42,7 +42,7 @@ roles:
   writer:
     primary:
       provider: "openrouter"
-      model: "minimax/minimax-m3.1-flash:free"
+      model: "poolside/laguna-s-2.1:free"
       max_tokens: 4096
       temperature: 0.2
     fallback: null
@@ -50,7 +50,7 @@ roles:
   judge:
     primary:
       provider: "openrouter"
-      model: "minimax/minimax-m3.1-flash:free"
+      model: "poolside/laguna-s-2.1:free"
       max_tokens: 4096
       temperature: 0.0
     fallback: null
@@ -76,11 +76,11 @@ providers:
 budgets:
   default:
     max_subquestions: 5
-    queries_per_subquestion: 3
-    pages_per_subquestion: 4
+    queries_per_subquestion: 2 # tightened for 50 req/day (PRD §5.3 lever 4)
+    pages_per_subquestion: 3
     total_llm_calls: 40 # min(60, floor(0.8 * R_day))
     total_tokens: 150000
-    wall_clock_s: 1200
+    wall_clock_s: 900 # raised from PRD 600: measured p95 577 s (results/preliminary_eval.json)
     reworks_per_subquestion: 1
     reworks_per_run: 3
     writer_regenerations: 2
@@ -90,7 +90,7 @@ budgets:
     pages_per_subquestion: 6
     total_llm_calls: 100
     total_tokens: 300000
-    wall_clock_s: 1800
+    wall_clock_s: 900 # PRD FR-2.2 server-side hard maximum
     reworks_per_subquestion: 1
     reworks_per_run: 5
     writer_regenerations: 3

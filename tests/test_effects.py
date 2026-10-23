@@ -22,9 +22,14 @@ def test_replay_mode_fail_closed(tmp_path, monkeypatch):
     from scout.config import load_settings
     load_settings()
 
-    recorder = EffectRecorder(snapshot_dir=tmp_path)
-    with pytest.raises(ReplayMissError):
-        recorder.execute_or_replay("nonexistent-key", lambda: "some result")
+    try:
+        recorder = EffectRecorder(snapshot_dir=tmp_path)
+        with pytest.raises(ReplayMissError):
+            recorder.execute_or_replay("nonexistent-key", lambda: "some result")
+    finally:
+        # The settings singleton is global: restore it so later tests run live.
+        monkeypatch.delenv("SCOUT_MODE")
+        load_settings()
 
 
 def test_fault_injection_disabled_by_default():

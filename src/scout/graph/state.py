@@ -98,6 +98,7 @@ class ResearchState(BaseModel):
 
     # Rework & Regeneration counters
     rework_counts: Dict[str, int] = Field(default_factory=dict)
+    rework_hints: Dict[str, str] = Field(default_factory=dict)
     total_reworks: int = 0
     writer_regenerations: int = 0
 
@@ -128,7 +129,9 @@ class ResearchState(BaseModel):
         return None
 
     def get_accepted_findings(self) -> List[Finding]:
-        return [f for f in self.findings if f.verified]
+        """Verified findings from accepted sub-questions only (PRD FR-2.4)."""
+        accepted = set(self.completed_subquestion_ids)
+        return [f for f in self.findings if f.verified and f.subquestion_id in accepted]
 
     def get_distinct_domains(self) -> List[str]:
-        return list({f.domain for f in self.findings if f.verified and f.domain})
+        return list({f.domain for f in self.get_accepted_findings() if f.domain})

@@ -35,6 +35,8 @@ class AdmissionController:
             (is_admitted, error_response_if_rejected)
         """
         settings = get_settings()
+        if not settings.admission_control.enabled:
+            return True, None
         provider = provider_override or settings.get_role_primary("planner").provider
 
         prov_cfg = settings.providers.get(provider)
@@ -53,7 +55,9 @@ class AdmissionController:
         if options and options.max_subquestions:
             projected_calls = min(options.max_subquestions * 6 + 5, settings.budgets["default"].total_llm_calls)
         else:
-            projected_calls = min(35, settings.budgets["default"].total_llm_calls)
+            projected_calls = min(
+                settings.admission_control.conservative_reserve_per_run, settings.budgets["default"].total_llm_calls
+            )
 
         if projected_calls > remaining_calls:
             # Calculate seconds until next UTC midnight

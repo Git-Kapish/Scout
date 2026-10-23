@@ -79,6 +79,7 @@ class ResearchStatusResponse(BaseModel):
     budget: BudgetInfo
     report: Optional[ReportData] = None
     termination_reason: Optional[str] = None
+    termination_detail: Optional[str] = None
 
 
 class ActionResponse(BaseModel):
