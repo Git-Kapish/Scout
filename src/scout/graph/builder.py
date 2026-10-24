@@ -56,7 +56,7 @@ def route_after_validation(
     state: ResearchState,
 ) -> Literal["write", "finalize", "finalize_fail"]:
     """Conditional edge from validate_citations: handles regenerations and claim stripping."""
-    if state.status == "failed" or state.termination_reason == "insufficient_evidence":
+    if state.status in ("failed", "cancelled") or state.termination_reason == "insufficient_evidence":
         return "finalize_fail"
 
     if not state.validation_result:

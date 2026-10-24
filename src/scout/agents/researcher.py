@@ -6,22 +6,53 @@ Query Generation -> Search -> SSRF-guarded Fetch -> BM25 Selection -> Finding Ex
 
 from __future__ import annotations
 
+import hashlib
 import logging
-import uuid
-from typing import List, Optional, Tuple
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
 
 from pydantic import BaseModel, Field
 
-from scout.config import get_settings
+from scout.config import find_project_root, get_settings
 from scout.effects.fault_injection import maybe_crash
-from scout.fetch.fetcher import PageFetcher
+from scout.effects.runtime import (
+    RUN_STOP_ERRORS,
+    BudgetExhaustedError,
+    RunCancelledError,
+    external_call,
+)
+from scout.fetch.fetcher import PageFetcher, PageFetchResult
 from scout.fetch.passage import select_top_passages_bm25, split_into_paragraphs
 from scout.llm import LLMClient
 from scout.schemas import Finding, ResearchResult, SubQuestion, ToolFailure
-from scout.search import SearchChain
+from scout.search import SearchChain, SearchResult
 from scout.validate.provenance import verify_snippet_in_page
 
 logger = logging.getLogger(__name__)
+
+
+def _page_cache_path(page_hash: str) -> Path:
+    return find_project_root() / "data" / "cache" / "pages" / f"{page_hash}.txt"
+
+
+def _store_page(res: PageFetchResult) -> Dict[str, Any]:
+    """Page text lives in the content-addressed disk cache, never in the Redis effect journal (FR-4.5)."""
+    if res.status == "ok":
+        path = _page_cache_path(res.page_hash)
+        if not path.exists():
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(res.text_content, encoding="utf-8")
+    return res.model_dump(exclude={"text_content"})
+
+
+def _load_page(data: Dict[str, Any]) -> PageFetchResult:
+    res = PageFetchResult.model_validate(data)
+    if res.status == "ok":
+        path = _page_cache_path(res.page_hash)
+        if not path.exists():
+            return res.model_copy(update={"status": "error", "error_message": "Cached page text missing"})
+        res.text_content = path.read_text(encoding="utf-8")
+    return res
 
 
 class QueryGenerationOutput(BaseModel):
@@ -90,12 +121,15 @@ class ResearcherAgent:
         self,
         sub_question: SubQuestion,
         remaining_budget: Optional[int] = None,
+        reformulation_hint: Optional[str] = None,
     ) -> List[str]:
         system_msg = QUERY_GEN_PROMPT.format(
             question=sub_question.question,
             rationale=sub_question.rationale,
             needs_recency=sub_question.needs_recency,
         )
+        if reformulation_hint:
+            system_msg += f"\nThe previous queries were insufficient. Reformulation hint: {reformulation_hint}\n"
         messages = [
             {"role": "system", "content": system_msg},
             {"role": "user", "content": f"Generate search queries for: {sub_question.question}"},
@@ -144,6 +178,8 @@ class ResearcherAgent:
                     response_model=ExtractionOutput,
                     remaining_token_budget=remaining_budget,
                 )
+            except RUN_STOP_ERRORS:
+                raise
             except Exception as e:
                 logger.warning("LLM extraction call failed on attempt %d for %s: %s", attempt, source_url, e)
                 break
@@ -161,7 +197,10 @@ class ResearcherAgent:
                         for f in verified_findings
                     )
                     if not already_exists:
-                        f_id = f"find_{uuid.uuid4().hex[:8]}"
+                        # Deterministic ID: re-extraction on rework or resume dedupes in merge_findings.
+                        f_id = "find_" + hashlib.sha256(
+                            f"{sub_question.id}|{source_url}|{candidate.snippet.strip()}".encode("utf-8")
+                        ).hexdigest()[:12]
                         verified_findings.append(
                             Finding(
                                 finding_id=f_id,
@@ -199,121 +238,152 @@ class ResearcherAgent:
         self,
         sub_question: SubQuestion,
         remaining_budget: Optional[int] = None,
-        max_pages: int = 3,
+        max_pages: Optional[int] = None,
+        reformulation_hint: Optional[str] = None,
     ) -> Tuple[ResearchResult, List[Finding]]:
+        budgets = self.settings.budgets
+        max_queries = min(budgets["default"].queries_per_subquestion, budgets["hard_limits"].queries_per_subquestion)
+        max_pages = max_pages or min(budgets["default"].pages_per_subquestion, budgets["hard_limits"].pages_per_subquestion)
         failures: List[ToolFailure] = []
         all_findings: List[Finding] = []
         searches_used = 0
         pages_fetched = 0
         llm_calls_used = 0
+        stop_status = None
 
-        # Step 1: Generate Queries
         try:
-            queries = self.generate_queries(sub_question, remaining_budget=remaining_budget)
-            llm_calls_used += 1
-        except Exception as e:
-            logger.error("Query generation failed for %s: %s", sub_question.id, e)
-            failures.append(ToolFailure(tool="query_gen", status="error", error_message=str(e)))
-            return (
-                ResearchResult(
-                    subquestion_id=sub_question.id,
-                    status="error",
-                    failures=failures,
-                    llm_calls_used=llm_calls_used,
-                ),
-                [],
-            )
-
-        # Step 2: Search
-        urls_to_fetch: List[Tuple[str, str, Optional[str]]] = []  # (url, domain, title)
-        for q in queries[:2]:  # cap queries dispatched
-            searches_used += 1
-            search_res = self.search_chain.search(q, max_results=4, max_per_domain=2)
-            if search_res.status != "ok":
-                failures.append(
-                    ToolFailure(
-                        tool="search",
-                        status=search_res.status,
-                        error_message=search_res.error_message or "Search returned no results",
-                        target=q,
-                    )
-                )
-            for hit in search_res.results:
-                if len(urls_to_fetch) < max_pages:
-                    urls_to_fetch.append((hit.url, hit.domain, hit.title))
-
-        maybe_crash("mid_research_after_searches")
-
-        if not urls_to_fetch:
-            return (
-                ResearchResult(
-                    subquestion_id=sub_question.id,
-                    status="no_results",
-                    searches_used=searches_used,
-                    llm_calls_used=llm_calls_used,
-                    failures=failures,
-                ),
-                [],
-            )
-
-        # Step 3: Fetch & Extract
-        for url, domain, title in urls_to_fetch:
-            pages_fetched += 1
-            fetch_res = self.fetcher.fetch(url)
-
-            maybe_crash("mid_research_after_fetches")
-
-            if fetch_res.status != "ok":
-                failures.append(
-                    ToolFailure(
-                        tool="fetch",
-                        status=fetch_res.status,
-                        error_message=fetch_res.error_message or "Fetch failed",
-                        target=url,
-                    )
-                )
-                continue
-
-            # Step 4: BM25 passage selection
-            paragraphs = split_into_paragraphs(fetch_res.text_content)
-            top_passages = select_top_passages_bm25(
-                query=sub_question.question,
-                paragraphs=paragraphs,
-                max_tokens=self.settings.fetch.bm25_max_tokens_per_page,
-            )
-
-            if not top_passages:
-                continue
-
-            # Step 5: Extract findings & verify provenance
-            maybe_crash("mid_extraction")
+            # Step 1: Generate Queries
             try:
-                page_findings, dropped, calls_done = self.extract_findings_from_passages(
-                    sub_question=sub_question,
-                    passages=top_passages,
-                    page_text=fetch_res.text_content,
-                    source_url=url,
-                    domain=domain,
-                    page_hash=fetch_res.page_hash,
-                    title=title,
-                    remaining_budget=remaining_budget,
+                queries = self.generate_queries(
+                    sub_question, remaining_budget=remaining_budget, reformulation_hint=reformulation_hint
                 )
-                llm_calls_used += calls_done
-                all_findings.extend(page_findings)
+                llm_calls_used += 1
+            except RUN_STOP_ERRORS:
+                raise
             except Exception as e:
-                logger.error("Extraction failed for %s: %s", url, e)
-                failures.append(
-                    ToolFailure(
-                        tool="extract",
+                logger.error("Query generation failed for %s: %s", sub_question.id, e)
+                failures.append(ToolFailure(tool="query_gen", status="error", error_message=str(e)))
+                return (
+                    ResearchResult(
+                        subquestion_id=sub_question.id,
                         status="error",
-                        error_message=str(e),
-                        target=url,
+                        failures=failures,
+                        llm_calls_used=llm_calls_used,
+                    ),
+                    [],
+                )
+
+            # Step 2: Search
+            urls_to_fetch: List[Tuple[str, str, Optional[str]]] = []  # (url, domain, title)
+            for q in queries[:max_queries]:
+                searches_used += 1
+                search_res = external_call(
+                    "search",
+                    "search",
+                    {"query": q, "max_results": 4, "max_per_domain": 2},
+                    lambda: self.search_chain.search(q, max_results=4, max_per_domain=2),
+                    lambda res: res.model_dump(),
+                    SearchResult.model_validate,
+                )
+                if search_res.status != "ok":
+                    failures.append(
+                        ToolFailure(
+                            tool="search",
+                            status=search_res.status,
+                            error_message=search_res.error_message or "Search returned no results",
+                            target=q,
+                        )
                     )
+                for hit in search_res.results:
+                    if len(urls_to_fetch) < max_pages:
+                        urls_to_fetch.append((hit.url, hit.domain, hit.title))
+
+            maybe_crash("mid_research_after_searches")
+
+            if not urls_to_fetch:
+                return (
+                    ResearchResult(
+                        subquestion_id=sub_question.id,
+                        status="no_results",
+                        searches_used=searches_used,
+                        llm_calls_used=llm_calls_used,
+                        failures=failures,
+                    ),
+                    [],
+                )
+
+            # Step 3: Fetch & Extract
+            for url, domain, title in urls_to_fetch:
+                pages_fetched += 1
+                fetch_res = external_call(
+                    "fetch", "fetch", {"url": url}, lambda: self.fetcher.fetch(url), _store_page, _load_page
+                )
+
+                maybe_crash("mid_research_after_fetches")
+
+                if fetch_res.status != "ok":
+                    failures.append(
+                        ToolFailure(
+                            tool="fetch",
+                            status=fetch_res.status,
+                            error_message=fetch_res.error_message or "Fetch failed",
+                            target=url,
+                        )
+                    )
+                    continue
+
+                # Step 4: BM25 passage selection
+                paragraphs = split_into_paragraphs(fetch_res.text_content)
+                top_passages = select_top_passages_bm25(
+                    query=sub_question.question,
+                    paragraphs=paragraphs,
+                    max_tokens=self.settings.fetch.bm25_max_tokens_per_page,
+                )
+
+                if not top_passages:
+                    continue
+
+                # Step 5: Extract findings & verify provenance
+                maybe_crash("mid_extraction")
+                try:
+                    page_findings, dropped, calls_done = self.extract_findings_from_passages(
+                        sub_question=sub_question,
+                        passages=top_passages,
+                        page_text=fetch_res.text_content,
+                        source_url=url,
+                        domain=domain,
+                        page_hash=fetch_res.page_hash,
+                        title=title,
+                        remaining_budget=remaining_budget,
+                    )
+                    llm_calls_used += calls_done
+                    all_findings.extend(page_findings)
+                except RUN_STOP_ERRORS:
+                    raise
+                except Exception as e:
+                    logger.error("Extraction failed for %s: %s", url, e)
+                    failures.append(
+                        ToolFailure(
+                            tool="extract",
+                            status="error",
+                            error_message=str(e),
+                            target=url,
+                        )
+                    )
+        except (BudgetExhaustedError, RunCancelledError) as stop:
+            # Refused before dispatch: keep what was gathered (PRD FR-3.4 budget_exhausted -> write).
+            logger.warning("Research for %s stopped: %s", sub_question.id, stop)
+            if isinstance(stop, BudgetExhaustedError):
+                stop_status = "budget_exhausted"
+                failures.append(
+                    ToolFailure(tool="budget_guard", status="budget_exhausted", error_message=str(stop), target=sub_question.id)
                 )
 
         # Status determination
         if all_findings:
             status = "ok" if len(all_findings) >= 2 else "partial"
+        elif stop_status:
+            status = stop_status
         else:
             status = "no_results" if pages_fetched > 0 else "error"
 

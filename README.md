@@ -57,7 +57,7 @@ Scout uses a stateful LangGraph workflow with five stages.
 | **Writer** | Synthesizes findings into a structured report |
 | **Citation validator** | Validates report structure and checks that citations resolve to stored findings grounded in source text |
 
-A completed run returns a structured answer, citations with source URLs, and a schema and integrity audit.
+A completed run returns the answer first, followed by a numbered list of sources (title, URL, retrieval date, and the verbatim quote behind each citation).
 
 ## Architecture
 
@@ -129,7 +129,7 @@ Scout records model calls, tool calls, execution steps, and latency measurements
 - **Worker coordination:** Lua leases and generation counters protect run ownership and checkpoint commits.
 - **Bounded resource use:** Admission control and in-flight ledgers enforce configured execution budgets.
 - **Evidence-grounded reporting:** Findings are checked against retrieved page text and citations are validated before publication.
-- **Live progress:** SSE streaming provides updates while a run is executing.
+- **Live progress:** SSE streaming provides updates while a run is executing; the CLI shows the current stage and prints the answer as soon as the run finishes.
 - **Trace inspection:** CLI and API commands expose run status, budget usage, execution steps, and latencies.
 - **Two interfaces:** A Rich-based CLI and a REST API support interactive and programmatic use.
 
@@ -183,6 +183,8 @@ Detailed results and methodology are available in [Preliminary Evaluation](docs/
 - A Tavily API key if using Tavily search
 
 DuckDuckGo is also supported by the search integration. Model selection, quotas, budgets, and timeouts are defined in [`config/settings.yaml`](config/settings.yaml).
+
+Every agent role uses the free OpenRouter model `poolside/laguna-s-2.1:free` by default. Free models can be retired without notice; if runs fail with `provider_unavailable`, choose another `:free` model on [OpenRouter](https://openrouter.ai/models?max_price=0) and update the `model` field of each role in `config/settings.yaml`.
 
 ### 1. Clone the repository
 
@@ -251,15 +253,45 @@ uv run scout
 uv run scout ask "What are the trade-offs between Redis and SQLite?"
 ```
 
+The command shows live progress and then prints the result in the same terminal; a separate `scout status` call is not needed:
+
+```text
+● Planned 3 sub-questions
+  1. How does Redis persist data to disk?
+  2. How does SQLite handle concurrent writes?
+  3. ...
+  ↳ 4 verified findings for sq_1
+● Sub-questions: 1 accepted
+⠋ Researching: How does SQLite handle concurrent writes?… (94s · Ctrl+C to detach)
+
+─────────────────────────────── Answer ───────────────────────────────
+Redis vs SQLite
+Executive Summary: ...
+Durability
+ • Redis persists snapshots and an append-only file. [1]
+
+──────────────────────────── Sources (9) ─────────────────────────────
+[1] Redis persistence
+    https://redis.io/docs/latest/operate/oss_and_stack/management/persistence/
+    Retrieved 2026-10-21 09:12 UTC
+    "Redis provides a range of persistence options ..."
+──────────────────────────────────────────────────────────────────────
+9/9 claims cited · 15 LLM calls · 24,826 tokens · 6 searches · 258s · run run_3f2a...
+```
+
+- On an interactive terminal the answer is streamed in progressively. Set `SCOUT_NO_STREAM=1`, or pipe the output, to print it at once.
+- Ctrl+C detaches from the run without cancelling it. Reattach with `uv run scout watch <run_id>`.
+- If a run fails or is cancelled, the CLI prints the reason, the provider's error message, and a suggested next step, such as `uv run scout resume <run_id>` after a quota reset.
+
 ### Command reference
 
 | Command | Description |
 |---|---|
 | `uv run scout` | Open the interactive research shell |
-| `uv run scout ask "<query>"` | Submit a question and stream results |
-| `uv run scout run "<query>"` | Submit a question to the API and stream SSE progress |
-| `uv run scout watch <run_id>` | Stream events from an active run |
-| `uv run scout status <run_id>` | View run status, budget usage, and the rendered report |
+| `uv run scout ask "<query>"` | Research a question and print the answer and sources when it finishes |
+| `uv run scout run "<query>"` | Same as `ask`; add `--no-watch` to submit and return immediately |
+| `uv run scout watch <run_id>` | Reattach to a run: live progress, then its answer or failure reason |
+| `uv run scout status <run_id>` | View run status and the rendered report, or why the run failed |
 | `uv run scout trace <run_id>` | Inspect ordered execution steps and latencies |
 | `uv run scout cancel <run_id>` | Request cancellation of an active run |
 | `uv run scout resume <run_id>` | Resume a stalled or interrupted run |

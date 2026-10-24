@@ -20,12 +20,14 @@ from scout.graph.supervisor import SupervisorReviewer
 from scout.llm import LLMResponse, LLMUsage
 from scout.schemas import Claim, Report, ReportSection, SubQuestion
 from scout.search import FixtureSearchAdapter, SearchChain, extract_domain
+from scout.store.ledgers import LedgerStore
 from scout.store.redis_keys import (
     key_run_committed,
     key_run_findings,
     key_run_meta,
     key_run_report,
 )
+from scout.trace.store import TraceStore
 from scout.worker import ResearchWorker
 
 
@@ -152,6 +154,39 @@ def test_worker_end_to_end_execution(clean_redis):
 
     findings = clean_redis.hgetall(key_run_findings(run_id))
     assert len(findings) >= 4
+
+    # SSE clients get progress details and a terminal event so the CLI can show the answer
+    events = [{k.decode(): v.decode() for k, v in e[1].items()} for e in clean_redis.xrange(f"run:{run_id}:events")]
+    plan_event = next(e for e in events if e.get("node") == "plan")
+    assert json.loads(plan_event["subquestions"])
+    assert events[-1]["event"] == "run_completed"
+
+    # Search and fetch went through the effect journal, and every effect is in the trace
+    assert clean_redis.hlen(f"run:{run_id}:effects") > 0
+    ok, msg = TraceStore(clean_redis).verify_trace_equals_ledger(run_id)
+    assert ok, msg
+
+    # Ledger counts come from the dispatch meter
+    budget = LedgerStore(clean_redis).get_run_budget(run_id)
+    assert budget.searches > 0 and budget.fetches > 0
+
+
+def test_worker_hooks_record_provider_usage_and_read_cancellation(clean_redis):
+    run_id = f"hooks_{uuid.uuid4().hex[:8]}"
+    provider = f"test_provider_{uuid.uuid4().hex[:6]}"
+    worker = ResearchWorker(redis_url="redis://127.0.0.1:6379/0", worker_id="worker_hooks")
+    hooks = worker._run_hooks(run_id)
+
+    hooks.record_provider_usage(provider, 1, 0)
+    hooks.record_provider_usage(provider, 0, 120)
+    assert LedgerStore(clean_redis).get_provider_daily_usage(provider) == (1, 120)
+
+    assert hooks.is_cancelled() is False
+    clean_redis.hset(key_run_meta(run_id), "cancellation_requested", "1")
+    assert hooks.is_cancelled() is True
+
+    for k in clean_redis.keys(f"*{run_id}*") + clean_redis.keys(f"provider:{provider}:*"):
+        clean_redis.delete(k)
 
 
 def test_stalled_worker_preemption_and_fencing(clean_redis):

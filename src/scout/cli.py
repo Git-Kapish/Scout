@@ -16,6 +16,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import signal
 import sys
 import threading
@@ -33,6 +34,7 @@ if sys.platform == "win32":
 import httpx
 from rich.console import Console
 from rich.markdown import Markdown
+from rich.markup import escape
 from rich.panel import Panel
 from rich.prompt import Prompt
 from rich.rule import Rule
@@ -82,133 +84,226 @@ def cmd_run(args: argparse.Namespace) -> None:
         cmd_watch(argparse.Namespace(run_id=run_id, api_url=api_url))
 
 
+TERMINAL_EVENTS = ("run_completed", "run_completed_partial", "run_failed", "run_cancelled")
+TERMINAL_STATUSES = ("completed", "completed_partial", "failed", "cancelled")
+
+# Next activity after each graph node finishes (node_completed events carry the finished node).
+_NEXT_STAGE = {
+    "init_run": "Planning sub-questions",
+    "plan": "Choosing the first sub-question",
+    "research": "Reviewing the evidence",
+    "review": "Choosing the next step",
+    "write": "Validating citations",
+    "validate_citations": "Finalizing the report",
+}
+
+# Actionable hints for failure reasons recorded in run meta.
+_FAILURE_HINTS = {
+    "quota_limited": "The model provider's free quota is exhausted. Wait for it to reset, then run `scout resume {run_id}`.",
+    "provider_unavailable": "The model provider rejected the request. Check OPENROUTER_API_KEY and that the model in config/settings.yaml is still offered, then `scout resume {run_id}`.",
+    "replay_miss": "Replay mode had no recorded response for a call. Re-record the fixture or set scout_mode to live.",
+    "insufficient_evidence": "Not enough verified evidence was found to write a grounded answer. Try a narrower or rephrased question.",
+    "missing_report": "The writer did not produce a report.",
+    "wall_clock_timeout": "The run hit its wall-clock budget.",
+    "llm_calls_exhausted": "The run used up its LLM call budget.",
+    "token_budget_exhausted": "The run used up its token budget.",
+    "max_resume_attempts_exceeded": "The run crashed too many times and was given up.",
+}
+
+
+def _stream_enabled() -> bool:
+    return console.is_terminal and not os.getenv("SCOUT_NO_STREAM")
+
+
+class _ProgressView:
+    """Turns SSE events into a live spinner line plus persistent milestone lines."""
+
+    def __init__(self, run_id: str) -> None:
+        self.run_id = run_id
+        self.started = time.monotonic()
+        self.stage = "Waiting for a worker"
+        self.subquestions: dict[str, str] = {}
+        self.active_sq: Optional[str] = None
+        self.status = console.status(self._status_text(), spinner="dots")
+
+    def _status_text(self) -> str:
+        return f"[cyan]{self.stage}…[/] [dim]({time.monotonic() - self.started:.0f}s · Ctrl+C to detach)[/]"
+
+    def __enter__(self) -> "_ProgressView":
+        self.status.start()
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.status.stop()
+
+    def _set_stage(self, stage: str) -> None:
+        self.stage = stage
+        self.tick()
+
+    def tick(self) -> None:
+        self.status.update(self._status_text())
+
+    def handle(self, event_type: str, payload: dict) -> None:
+        if event_type == "run_started":
+            self._set_stage("Waiting for a worker")
+        elif event_type == "node_completed":
+            self._node_completed(payload)
+        elif event_type == "budget_warning":
+            console.print("  [orange3]⚠ 80% of the run budget used[/]")
+        elif event_type == "budget_exhausted":
+            console.print(f"  [orange3]⚠ Budget exhausted ({payload.get('reason')}); writing with the evidence so far[/]")
+        elif event_type == "run_cancel_requested":
+            self._set_stage("Cancelling")
+        elif event_type == "run_resumed":
+            self._set_stage("Resuming from the last checkpoint")
+        else:
+            self.tick()
+
+    def _node_completed(self, payload: dict) -> None:
+        node = payload.get("node", "")
+        if node == "plan" and payload.get("subquestions"):
+            try:
+                self.subquestions = dict(json.loads(payload["subquestions"]))
+            except (TypeError, ValueError):
+                self.subquestions = {}
+            console.print(f"[bold]●[/] Planned {len(self.subquestions)} sub-questions")
+            for idx, q in enumerate(self.subquestions.values(), 1):
+                console.print(f"  [dim]{idx}.[/] {escape(q)}")
+        elif node == "pick_next":
+            sq_id = payload.get("subquestion_id")
+            if sq_id:
+                self.active_sq = sq_id
+                question = self.subquestions.get(sq_id, sq_id)
+                self._set_stage(f"Researching: {escape(question)}")
+                return
+            self._set_stage("Writing the answer")
+            return
+        elif node == "research" and "findings" in payload:
+            console.print(f"  [dim]↳ {payload['findings']} verified findings for {self.active_sq or 'sub-question'}[/]")
+        elif node == "review" and "accepted" in payload:
+            console.print(
+                f"[bold]●[/] Sub-questions: [green]{payload['accepted']} accepted[/]"
+                + (f", [yellow]{payload['abandoned']} abandoned[/]" if payload.get("abandoned", "0") != "0" else "")
+            )
+        self._set_stage(_NEXT_STAGE.get(node, self.stage))
+
+
+def _parse_sse(response: httpx.Response):
+    """Yields (event_type, event_id, raw_data) from an SSE response."""
+    event_type, event_id, data_buffer = "progress", None, []
+    for line in response.iter_lines():
+        line = line.strip()
+        if not line:
+            if data_buffer:
+                yield event_type, event_id, "\n".join(data_buffer)
+            event_type, event_id, data_buffer = "progress", None, []
+            continue
+        if line.startswith("id:"):
+            event_id = line[3:].strip()
+        elif line.startswith("event:"):
+            event_type = line[6:].strip()
+        elif line.startswith("data:"):
+            data_buffer.append(line[5:].strip())
+
+
 def cmd_watch(args: argparse.Namespace) -> None:
     api_url = args.api_url.rstrip("/")
     run_id = args.run_id
     last_event_id: Optional[str] = getattr(args, "last_event_id", None)
     max_reconnects = 10
     reconnect_delay = 2.0
+    events_url = f"{api_url}/research/{run_id}/events"
 
-    for attempt in range(max_reconnects + 1):
-        events_url = f"{api_url}/research/{run_id}/events"
-        params = {}
-        headers = {}
-        if last_event_id:
-            params["last_event_id"] = last_event_id
-            headers["Last-Event-ID"] = last_event_id
-
-        if attempt == 0:
-            console.print(f"[dim]Connecting to SSE stream: {events_url}[/]")
-        else:
-            console.print(f"[dim]Reconnecting to SSE stream (attempt {attempt}, last event ID: {last_event_id or 'none'})...[/]")
-
-        try:
-            with httpx.stream("GET", events_url, params=params, headers=headers, timeout=None) as response:
-                if response.status_code == 404:
-                    console.print(f"[bold red]Error:[/] Run '{run_id}' not found.")
-                    return
-
-                event_type = "progress"
-                event_id = None
-                data_buffer = []
-
-                for line in response.iter_lines():
-                    line = line.strip()
-                    if not line:
-                        if data_buffer:
-                            raw_data = "\n".join(data_buffer)
-                            data_buffer = []
-                            _handle_event(event_type, event_id, raw_data)
-                            if event_type in ("run_completed", "run_completed_partial"):
-                                _fetch_and_display_report(run_id, api_url)
-                                return
-                            if event_type in ("run_failed", "run_cancelled"):
-                                return
-                        event_type = "progress"
-                        event_id = None
-                        continue
-
-                    if line.startswith("id:"):
-                        event_id = line[3:].strip()
-                        last_event_id = event_id
-                    elif line.startswith("event:"):
-                        event_type = line[6:].strip()
-                    elif line.startswith("data:"):
-                        data_buffer.append(line[5:].strip())
-
-            # Normal stream termination
-            return
-
-        except KeyboardInterrupt:
-            console.print(f"\n[yellow]Interrupted by user.[/]")
-            return
-        except (httpx.RequestError, httpx.HTTPError) as e:
-            # Check if run is still in progress
+    with _ProgressView(run_id) as view:
+        for attempt in range(max_reconnects + 1):
+            headers = {"Last-Event-ID": last_event_id} if last_event_id else {}
+            params = {"last_event_id": last_event_id} if last_event_id else {}
             try:
-                st = httpx.get(f"{api_url}/research/{run_id}", timeout=5.0).json()
-                if st.get("status") in ("completed", "completed_partial"):
-                    console.print(f"[bold green]Run reached terminal state:[/] {st.get('status')}")
-                    _fetch_and_display_report(run_id, api_url)
-                    return
-                elif st.get("status") in ("failed", "cancelled"):
-                    console.print(f"[bold red]Run reached terminal state:[/] {st.get('status')}")
-                    return
-            except Exception:
-                pass
-
-            if attempt < max_reconnects:
-                time.sleep(reconnect_delay)
-                continue
-            else:
-                console.print(
-                    f"\n[dim]Disconnected from stream ({e}). Reconnect with: scout watch {run_id} "
-                    f"(last event ID: {last_event_id or 'none'})[/]"
-                )
+                with httpx.stream("GET", events_url, params=params, headers=headers, timeout=None) as response:
+                    if response.status_code == 404:
+                        view.status.stop()
+                        console.print(f"[bold red]Error:[/] Run '{run_id}' not found.")
+                        return
+                    for event_type, event_id, raw_data in _parse_sse(response):
+                        if event_id:
+                            last_event_id = event_id
+                        try:
+                            payload = json.loads(raw_data)
+                        except ValueError:
+                            payload = {"raw": raw_data}
+                        if event_type in TERMINAL_EVENTS:
+                            break
+                        view.handle(event_type, payload)
+                # Stream ended: done if the run is terminal, otherwise the connection dropped early
+                if _run_status(run_id, api_url) in TERMINAL_STATUSES:
+                    break
+                raise httpx.RemoteProtocolError("event stream closed before the run finished")
+            except KeyboardInterrupt:
+                view.status.stop()
+                console.print(f"\n[yellow]Detached.[/] The run continues in the background: [bold]scout watch {run_id}[/]")
                 return
+            except httpx.HTTPError as e:
+                if _run_status(run_id, api_url) in TERMINAL_STATUSES:
+                    break
+                if attempt >= max_reconnects:
+                    view.status.stop()
+                    console.print(
+                        f"\n[dim]Disconnected from stream ({e}). Reconnect with: scout watch {run_id}[/]"
+                    )
+                    return
+                view.stage = "Reconnecting"
+                view.tick()
+                time.sleep(reconnect_delay)
+
+    _fetch_and_display_report(run_id, api_url)
 
 
-def _handle_event(event_type: str, event_id: Optional[str], raw_data: str) -> None:
+def _run_status(run_id: str, api_url: str) -> Optional[str]:
     try:
-        payload = json.loads(raw_data)
+        return httpx.get(f"{api_url}/research/{run_id}", timeout=5.0).json().get("status")
     except Exception:
-        payload = {"raw": raw_data}
+        return None
 
-    ts = time.strftime("%H:%M:%S")
-    if event_type == "run_started":
-        console.print(f"[{ts}] [bold green]🚀 Run Started[/] question: {payload.get('question')}")
-    elif event_type == "plan_created":
-        subqs = payload.get("plan", {}).get("sub_questions", [])
-        console.print(f"[{ts}] [bold blue]📋 Plan Generated[/] ({len(subqs)} sub-questions)")
-        for sq in subqs:
-            console.print(f"     • [cyan]{sq.get('id')}[/]: {sq.get('question')}")
-    elif event_type == "subquestion_started":
-        console.print(f"[{ts}] [yellow]🔍 Investigating[/] sub-question: {payload.get('subquestion_id')}")
-    elif event_type == "search_completed":
-        console.print(f"[{ts}] [dim]🌐 Search completed[/] for: {payload.get('query')}")
-    elif event_type == "page_fetched":
-        console.print(f"[{ts}] [dim]📄 Page fetched[/]: {payload.get('url')} (status: {payload.get('status')})")
-    elif event_type == "findings_extracted":
-        count = payload.get("count", 0)
-        console.print(f"[{ts}] [bold magenta]💡 Verified Findings[/]: extracted {count} findings")
-    elif event_type == "review_decision":
-        decision = payload.get("decision")
-        color = "green" if decision == "accept" else "yellow" if decision == "rework" else "red"
-        console.print(f"[{ts}] [bold]🧐 Review Decision:[/] [{color}]{decision}[/] for {payload.get('subquestion_id')}")
-    elif event_type == "budget_warning":
-        console.print(f"[{ts}] [bold orange3]⚠️ Budget Warning:[/] {payload.get('message')}")
-    elif event_type == "writing_started":
-        console.print(f"[{ts}] [bold cyan]✍️ Writer Synthesizing Report[/]")
-    elif event_type == "validation_result":
-        valid = payload.get("valid")
-        console.print(f"[{ts}] [bold]🔍 Citation Validation:[/] valid={valid}")
-    elif event_type in ("run_completed", "run_completed_partial"):
-        console.print(f"\n[{ts}] [bold green]✅ Research Run Finished ({event_type})![/]")
-    elif event_type in ("run_failed", "run_cancelled"):
-        console.print(f"\n[{ts}] [bold red]🛑 Research Run Ended ({event_type}):[/] {payload.get('reason')}")
-    elif event_type == "heartbeat":
-        pass
-    else:
-        console.print(f"[{ts}] [dim]{event_type}[/]: {payload}")
+
+_REF_LINE = re.compile(r"^\[(\d+)\]\s+\*\*(.+?)\*\*\s+-\s+\[(.+?)\]\((.+?)\)(?:\s+\(Retrieved (.+?)\))?\s*$")
+_QUOTE_LINE = re.compile(r"^(?:>\s*)?\*Quote:\s*\"(.*)\"\*\s*$")
+
+
+def _parse_references(references_md: str) -> list[dict]:
+    """Parses the renderer's References section into [{num, title, url, retrieved, quote}]."""
+    refs: list[dict] = []
+    for raw in references_md.splitlines():
+        line = raw.strip()
+        m = _REF_LINE.match(line)
+        if m:
+            refs.append({"num": m.group(1), "title": m.group(2), "url": m.group(4), "retrieved": m.group(5), "quote": None})
+            continue
+        q = _QUOTE_LINE.match(line)
+        if q and refs:
+            refs[-1]["quote"] = q.group(1)
+    return refs
+
+
+def _print_markdown(md: str) -> None:
+    """Prints Markdown, streaming it block by block and word by word on an interactive terminal."""
+    if not _stream_enabled():
+        console.print(Markdown(md))
+        return
+    from rich.live import Live
+
+    blocks = [b for b in re.split(r"\n\s*\n", md) if b.strip()]
+    total_words = max(1, len(md.split()))
+    delay = min(0.015, 4.0 / total_words)  # cap the whole answer at ~4 s
+    for block in blocks:
+        words = re.split(r"(\s+)", block)
+        shown = ""
+        with Live(Markdown(""), console=console, refresh_per_second=30, transient=False) as live:
+            for idx, piece in enumerate(words):
+                shown += piece
+                if piece.strip() and idx % 2 == 0:
+                    live.update(Markdown(shown))
+                    time.sleep(delay)
+            live.update(Markdown(block))
 
 
 def display_report_result(
@@ -217,114 +312,96 @@ def display_report_result(
     question: Optional[str] = None,
     run_id: Optional[str] = None,
 ) -> None:
-    """Renders the real narrative answer followed by verified citations and validation audit."""
+    """Renders the answer first, then a numbered sources list, then a one-line run summary."""
     markdown_text = report_dict.get("markdown", "")
-
-    # Separate Answer from References/Citations
     if "## References" in markdown_text:
-        parts = markdown_text.split("## References", 1)
-        answer_md = parts[0].strip()
-        references_md = ("## References\n" + parts[1]).strip()
+        answer_md, references_md = markdown_text.split("## References", 1)
     else:
-        answer_md = markdown_text.strip()
-        references_md = ""
+        answer_md, references_md = markdown_text, ""
+    answer_md = answer_md.strip()
 
-    # 1. DISPLAY THE REAL ANSWER
+    # 1. The answer
     console.print()
-    if answer_md:
-        console.print(
-            Panel(
-                Markdown(answer_md),
-                title="[bold cyan]💡 RESEARCH ANSWER[/bold cyan]",
-                border_style="cyan",
-                padding=(1, 2),
-            )
-        )
-    else:
-        summary = report_dict.get("summary", "No narrative answer generated.")
-        console.print(Panel(f"[bold]Summary:[/] {summary}", title="[bold cyan]💡 RESEARCH ANSWER[/bold cyan]", border_style="cyan"))
-
+    console.print(Rule("[bold cyan]Answer[/]", style="cyan"))
+    console.print()
+    _print_markdown(answer_md or f"**Summary:** {report_dict.get('summary', 'No narrative answer generated.')}")
     console.print()
 
-    # 2. DISPLAY CITATIONS & SOURCES (Coming AFTER the Answer)
-    if references_md:
-        console.print(
-            Panel(
-                Markdown(references_md),
-                title="[bold green]📚 VERIFIED CITATIONS & EVIDENCE SOURCES[/bold green]",
-                border_style="green",
-                padding=(1, 2),
-            )
-        )
-    else:
-        sources = report_dict.get("sources", [])
-        if sources:
-            src_table = Table(title="Verified Evidence Sources", box=None)
-            src_table.add_column("Ref", style="cyan", width=6)
-            src_table.add_column("Source", style="white")
-            for idx, s in enumerate(sources, 1):
-                label = s.get("label", f"[{idx}]")
-                title = s.get("title") or s.get("url") or "Source"
-                url = s.get("url", "")
-                src_table.add_row(label, f"[bold]{title}[/bold]\n[dim]{url}[/dim]")
-            console.print(Panel(src_table, title="[bold green]📚 VERIFIED CITATIONS & EVIDENCE SOURCES[/bold green]", border_style="green"))
-        else:
-            console.print(Panel("[dim]No external citations required.[/dim]", title="[bold green]📚 VERIFIED CITATIONS & EVIDENCE SOURCES[/bold green]", border_style="green"))
-
+    # 2. Sources, after the answer, one block per citation
+    refs = _parse_references(references_md)
+    console.print(Rule(f"[bold green]Sources ({len(refs)})[/]" if refs else "[bold green]Sources[/]", style="green"))
     console.print()
+    if refs:
+        for ref in refs:
+            console.print(f"[bold cyan][{ref['num']}][/] [bold]{escape(ref['title'])}[/]")
+            console.print(f"    [link={ref['url']}]{escape(ref['url'])}[/link]", style="blue", soft_wrap=True)
+            if ref["retrieved"]:
+                console.print(f"    [dim]Retrieved {ref['retrieved']}[/]")
+            if ref["quote"]:
+                console.print(f"    [italic dim]“{escape(ref['quote'])}”[/]")
+            console.print()
+    elif references_md.strip():
+        console.print(Markdown(references_md.strip()))
+        console.print()
+    else:
+        console.print("[dim]No external citations.[/]\n")
 
-    # 3. DISPLAY QUALITY, CITATION & SCHEMA VALIDATION AUDIT
+    # 3. One-line run summary
     claims = report_dict.get("claims", [])
-    total_claims = len(claims)
-    unresolved_count = sum(1 for c in claims if not (c.get("citations") or c.get("finding_ids")))
-
-    audit_table = Table(box=None, show_header=False)
-    audit_table.add_column("Property", style="bold cyan", width=24)
-    audit_table.add_column("Value", style="white")
-
-    if total_claims > 0:
-        if unresolved_count == 0:
-            cit_val = f"[bold green]✓ 100% Resolved[/bold green] ({total_claims}/{total_claims} claims grounded in verified findings)"
-        else:
-            cit_val = f"[bold yellow]⚠️ {total_claims - unresolved_count}/{total_claims} Resolved[/bold yellow]"
-    else:
-        cit_val = "[bold green]✓ Validated[/bold green] (Evidence registry consistent)"
-
-    audit_table.add_row("Citation Integrity:", cit_val)
-    audit_table.add_row("Schema Validation:", "[bold green]✓ Valid[/bold green] (Verified against Pydantic ReportSchema v1)")
-    audit_table.add_row("Evidence Provenance:", "[bold green]✓ Verified[/bold green] (Quotes mechanically verified against raw text)")
-
+    grounded = sum(1 for c in claims if c.get("citations") or c.get("finding_ids"))
+    parts = []
+    if claims:
+        color = "green" if grounded == len(claims) else "yellow"
+        parts.append(f"[{color}]{grounded}/{len(claims)} claims cited[/]")
     if budget:
-        calls = budget.get("llm_calls", 0)
         tokens = budget.get("tokens_used", budget.get("tokens_in", 0) + budget.get("tokens_out", 0))
-        searches = budget.get("searches", 0)
-        elapsed = budget.get("elapsed_s", 0)
-        audit_table.add_row("Resource Stats:", f"{calls} LLM calls • {tokens} tokens • {searches} searches")
-        if elapsed:
-            audit_table.add_row("Wall-Clock Time:", f"{elapsed:.1f}s")
-
-    console.print(Panel(audit_table, title="[bold]Quality & Integrity Audit[/bold]", border_style="dim green"))
+        parts.append(f"{budget.get('llm_calls', 0)} LLM calls")
+        parts.append(f"{tokens:,} tokens")
+        parts.append(f"{budget.get('searches', 0)} searches")
+        if budget.get("elapsed_s"):
+            parts.append(f"{budget['elapsed_s']:.0f}s")
+    if run_id:
+        parts.append(f"run {run_id}")
+    if parts:
+        console.print(Rule(style="dim"))
+        console.print("[dim]" + " · ".join(parts) + "[/]")
     console.print()
+
+
+def display_failure(data: dict) -> None:
+    """Explains why a run did not produce a report, with a next step."""
+    run_id = data.get("run_id", "")
+    status = data.get("status", "failed")
+    reason = data.get("termination_reason") or "unknown"
+    color = "yellow" if status == "cancelled" else "red"
+    lines = [f"[bold {color}]Run {status}[/] — reason: [bold]{reason}[/]"]
+    if data.get("termination_detail"):
+        lines.append(f"[dim]{escape(data['termination_detail'])}[/]")
+    hint = _FAILURE_HINTS.get(reason)
+    if hint and status != "cancelled":
+        lines.append("")
+        lines.append(hint.format(run_id=run_id))
+    console.print(Panel("\n".join(lines), border_style=color, title=f"Run {run_id}"))
 
 
 def _fetch_and_display_report(run_id: str, api_url: str) -> None:
     try:
         resp = httpx.get(f"{api_url}/research/{run_id}", timeout=10.0)
-        if resp.status_code == 200:
-            data = resp.json()
-            if data.get("report"):
-                display_report_result(
-                    data["report"],
-                    budget=data.get("budget"),
-                    question=data.get("question"),
-                    run_id=run_id,
-                )
-            else:
-                console.print(f"[dim]No report found for run '{run_id}'. Status: {data.get('status')}[/dim]")
-        else:
-            console.print(f"[bold red]Could not retrieve report:[/] HTTP {resp.status_code}")
-    except Exception as e:
-        console.print(f"[dim]Could not fetch final report for display: {e}[/dim]")
+    except httpx.HTTPError as e:
+        console.print(f"[dim]Could not fetch final report: {e}[/dim]")
+        return
+    if resp.status_code != 200:
+        console.print(f"[bold red]Could not retrieve report:[/] HTTP {resp.status_code}")
+        return
+    data = resp.json()
+    if data.get("report") and data["report"].get("markdown"):
+        display_report_result(data["report"], budget=data.get("budget"), question=data.get("question"), run_id=run_id)
+        if data.get("status") == "completed_partial":
+            console.print(f"[yellow]Partial answer[/] ({data.get('termination_reason') or 'budget'}): see Coverage Gaps above.\n")
+    elif data.get("status") in ("failed", "cancelled"):
+        display_failure(data)
+    else:
+        console.print(f"[dim]No report yet for run '{run_id}'. Status: {data.get('status')}[/dim]")
 
 
 def cmd_status(args: argparse.Namespace) -> None:
@@ -342,6 +419,8 @@ def cmd_status(args: argparse.Namespace) -> None:
     if data.get("report") and data["report"].get("markdown"):
         display_report_result(data["report"], budget=data.get("budget"), question=data.get("question"), run_id=run_id)
     else:
+        if data.get("status") in ("failed", "cancelled"):
+            display_failure(data)
         table = Table(title="Progress & Budget")
         table.add_column("Metric", style="cyan")
         table.add_column("Value", style="green")
@@ -519,7 +598,6 @@ def _execute_and_display_query(question: str, api_url: str) -> None:
         data = resp.json()
         run_id = data["run_id"]
         console.print(f"[bold green]Accepted Run ID:[/] {run_id} (status: [cyan]{data['status']}[/])")
-        console.print("[dim]Streaming research progress in real-time...[/dim]\n")
         cmd_watch(argparse.Namespace(run_id=run_id, api_url=api_url))
 
     except (httpx.ConnectError, httpx.RequestError) as conn_err:
@@ -531,7 +609,8 @@ def _execute_and_display_query(question: str, api_url: str) -> None:
 def _execute_direct_local(question: str, redis_url: str = "redis://127.0.0.1:6379/0") -> None:
     import redis
     from scout.worker import ResearchWorker
-    from scout.store.redis_keys import key_run_meta, key_run_report, key_run_budget
+    from scout.store.ledgers import LedgerStore
+    from scout.store.redis_keys import key_run_meta, key_run_report
 
     r = redis.Redis.from_url(redis_url)
     run_id = f"cli_{uuid.uuid4().hex[:10]}"
@@ -542,17 +621,13 @@ def _execute_direct_local(question: str, redis_url: str = "redis://127.0.0.1:637
     try:
         final_state = worker.execute_run(run_id=run_id, initial_question=question)
         report_raw = r.get(key_run_report(run_id))
-        budget_raw = r.get(key_run_budget(run_id))
         report_dict = (
             json.loads(report_raw)
             if report_raw
-            else (final_state.get("final_report").model_dump() if final_state.get("final_report") else {})
+            else (final_state.report.model_dump() if final_state.report else {})
         )
-        budget_dict = (
-            json.loads(budget_raw)
-            if budget_raw
-            else (final_state.get("budget").model_dump() if final_state.get("budget") else {})
-        )
+        # run:{id}:budget is a hash; LedgerStore parses it into ints
+        budget_dict = LedgerStore(r).get_run_budget(run_id).model_dump()
         display_report_result(report_dict, budget=budget_dict, question=question, run_id=run_id)
     except Exception as e:
         console.print(f"[bold red]Direct execution error:[/] {e}")

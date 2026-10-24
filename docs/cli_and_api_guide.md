@@ -34,12 +34,13 @@ Scout [Ask]: What are the performance trade-offs between Redis and SQLite?
 ```
 
 - Type your research query and press **Enter**.
-- Scout streams live planning and search progress to your terminal.
-- Once finished, Scout displays:
-  1. **💡 RESEARCH ANSWER**: Structured executive summary and narrative findings.
-  2. **📚 VERIFIED CITATIONS & EVIDENCE SOURCES**: Source URLs, titles, and exact quotes.
-  3. **🛡️ Quality & Integrity Audit**: Citation resolution rate, schema validation, and token/time statistics.
-- Type `exit` or `quit` to cleanly exit the shell.
+- A live progress line shows what the agents are doing (planning, researching each sub-question, writing, validating citations); the plan and each review decision stay on screen.
+- Once finished, Scout prints, in order:
+  1. **Answer**: title, executive summary and sections, with numbered citations like `[1]`. It streams in word by word on an interactive terminal (`SCOUT_NO_STREAM=1` prints it at once).
+  2. **Sources**: one block per citation number with the source title, URL, retrieval date and the verbatim quote the claim rests on.
+  3. **Run summary**: one line with cited claims, LLM calls, tokens, searches, wall-clock time and the run ID.
+- If the run fails or is cancelled, Scout prints the reason, the provider's error message and a suggested next step instead.
+- **Ctrl+C** while a run is in progress detaches without cancelling it (`scout watch <run_id>` reattaches). Type `exit` or `quit` to leave the shell.
 
 ---
 
@@ -60,8 +61,8 @@ uv run scout run "Compare Redis and SQLite" --no-watch
 
 | Command | Description | Example |
 |---|---|---|
-| `scout watch <run_id>` | Stream real-time Server-Sent Events from an active research run | `uv run scout watch run_da89cd251f4c` |
-| `scout status <run_id>` | Inspect run status, progress, budget counters, and rendered report | `uv run scout status run_da89cd251f4c` |
+| `scout watch <run_id>` | Reattach to a run: live progress, then its answer or failure reason | `uv run scout watch run_da89cd251f4c` |
+| `scout status <run_id>` | Inspect run status and rendered report, or the failure reason and detail | `uv run scout status run_da89cd251f4c` |
 | `scout trace <run_id>` | View ordered execution steps, tool latencies, and agent actions | `uv run scout trace run_da89cd251f4c` |
 | `scout cancel <run_id>` | Request cooperative cancellation of an active run | `uv run scout cancel run_da89cd251f4c` |
 | `scout resume <run_id>` | Recover and resume execution of a stalled or crashed run | `uv run scout resume run_da89cd251f4c` |
@@ -96,17 +97,13 @@ The Scout FastAPI service runs on port `8000` by default.
   - **Protocol**: Server-Sent Events (SSE)
   - **Headers**: `Last-Event-ID` *(optional, for resuming disconnected streams)*
   - **Event Types**:
-    - `run_started`: Run metadata and question confirmation.
-    - `plan_created`: Generated sub-questions.
-    - `subquestion_started`: Sub-question being investigated.
-    - `search_completed`: Search query completed.
-    - `page_fetched`: Web page successfully downloaded.
-    - `findings_extracted`: Verbatim verified findings count.
-    - `review_decision`: Supervisor quality decision (`accept` / `rework`).
-    - `budget_warning`: Resource budget advisory.
-    - `writing_started`: Synthesis phase begun.
-    - `validation_result`: Citation integrity audit outcome.
-    - `run_completed`: Final completion notification.
+    - `run_started`: Run accepted and queued.
+    - `node_completed`: A graph step finished. Carries `node` (`init_run`, `plan`, `pick_next`, `research`, `review`, `write`, `validate_citations`, `finalize`) plus, when relevant, `subquestions` (JSON object of id → question, on `plan`), `subquestion_id` (on `pick_next`), `findings` (count, on `research`) and `accepted` / `abandoned` (counts, on `review`).
+    - `budget_warning`: 80% of the run budget is used.
+    - `budget_exhausted`: A budget limit stopped new work (`reason`); the run synthesizes with the evidence so far.
+    - `run_cancel_requested` / `run_resumed`: Lifecycle actions from the API.
+    - `run_completed` / `run_completed_partial` / `run_failed` / `run_cancelled`: Terminal event with `reason` and, for failures, `detail` (the provider's error message).
+    - `heartbeat`: Sent after 15 s without other events.
 
 #### Get Run Status and Report
 - **`GET /research/{run_id}`**
@@ -132,9 +129,12 @@ The Scout FastAPI service runs on port `8000` by default.
         "markdown": "# Redis vs. SQLite...",
         "claims": [...],
         "sources": [...]
-      }
+      },
+      "termination_reason": null,
+      "termination_detail": null
     }
     ```
+  - For a failed run, `report` is `null`, `termination_reason` names the cause (for example `provider_unavailable`, `quota_limited`, `insufficient_evidence`) and `termination_detail` holds the provider's error message.
 
 #### Cancel Active Run
 - **`POST /research/{run_id}/cancel`**
@@ -160,9 +160,9 @@ Key parameters in `config/settings.yaml`:
 
 | Section | Parameter | Default | Purpose |
 |---|---|---|---|
-| `roles.*.primary` | `model` | `minimax/minimax-m3.1-flash:free` | Configured OpenRouter model for each agent role |
+| `roles.*.primary` | `model` | `poolside/laguna-s-2.1:free` | Configured OpenRouter model for each agent role |
 | `budgets.default` | `total_llm_calls` | `40` | Hard cap on LLM invocations per run |
-| `budgets.default` | `wall_clock_s` | `1200` | Hard timeout (seconds) per research run |
+| `budgets.default` | `wall_clock_s` | `900` | Hard timeout (seconds) per research run |
 | `search` | `provider_order` | `["tavily", "ddgs"]` | Fallback search provider precedence |
 | `redis` | `lease_ttl_s` | `15` | Worker lease TTL for crash detection |
 | `admission_control` | `conservative_reserve_per_run` | `35` | Projected LLM calls required to accept a new run |

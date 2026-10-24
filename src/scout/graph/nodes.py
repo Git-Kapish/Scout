@@ -11,7 +11,14 @@ from scout.agents.researcher import ResearcherAgent
 from scout.agents.writer import WriterAgent
 from scout.config import get_settings
 from scout.effects.fault_injection import maybe_crash
-from scout.graph.budget_guard import check_budget_guard, check_minimum_evidence_for_report
+from scout.effects.recorder import ReplayMissError
+from scout.effects.runtime import BudgetExhaustedError, RunCancelledError, current_hooks, metered
+from scout.graph.budget_guard import (
+    budget_meter,
+    budget_usage_ratio,
+    check_budget_guard,
+    check_minimum_evidence_for_report,
+)
 from scout.graph.state import ResearchState
 from scout.graph.supervisor import SupervisorReviewer
 from scout.validate.citation_validator import validate_report_citations
@@ -19,13 +26,22 @@ from scout.validate.markdown_renderer import render_markdown_report
 
 logger = logging.getLogger(__name__)
 
+_CANCELLED = {"status": "cancelled", "termination_reason": "cancelled"}
+
+
+def _cancel_requested(state: ResearchState) -> bool:
+    """Cancellation can arrive mid-run through the worker's hook, not only in the initial state (FR-4.4)."""
+    return state.cancellation_requested or state.status == "cancelled" or current_hooks().is_cancelled()
+
 
 def init_run_node(state: ResearchState) -> Dict[str, Any]:
     """Initializes the research run, setting up wall-clock deadlines and defaults."""
-    settings = get_settings()
-    default_budgets = settings.budgets["default"]
+    budgets = get_settings().budgets
 
-    wall_clock_s = state.options.get("wall_clock_s") or default_budgets.wall_clock_s
+    wall_clock_s = min(
+        state.options.get("wall_clock_s") or budgets["default"].wall_clock_s,
+        budgets["hard_limits"].wall_clock_s,
+    )
     deadline_ts = time.time() + wall_clock_s
 
     logger.info("Initializing run '%s' with deadline in %ds", state.run_id, wall_clock_s)
@@ -38,46 +54,57 @@ def init_run_node(state: ResearchState) -> Dict[str, Any]:
 
 def plan_node(state: ResearchState, planner_agent: PlannerAgent) -> Dict[str, Any]:
     """Decomposes the main research question into structured sub-questions."""
-    if state.cancellation_requested:
-        return {"status": "cancelled", "termination_reason": "cancelled"}
+    if _cancel_requested(state):
+        return dict(_CANCELLED)
 
-    settings = get_settings()
-    max_subq = state.options.get("max_subquestions") or settings.budgets["default"].max_subquestions
+    budgets = get_settings().budgets
+    max_subq = min(
+        state.options.get("max_subquestions") or budgets["default"].max_subquestions,
+        budgets["hard_limits"].max_subquestions,
+    )
 
     logger.info("Generating research plan for question: '%s'", state.question)
-    plan = planner_agent.plan(state.question, max_subquestions=max_subq)
-
-    # Update ledger for planner LLM call
-    ledger = state.budget_ledger
-    ledger.llm_calls += 1
+    # Provider failures propagate so the worker records a resumable quota_limited/provider_unavailable.
+    meter = budget_meter(state)
+    try:
+        with metered(meter):
+            plan = planner_agent.plan(state.question, max_subquestions=max_subq)
+    except RunCancelledError:
+        return {**_CANCELLED, "budget_ledger": meter.apply(state.budget_ledger)}
+    except BudgetExhaustedError as e:
+        return {"termination_reason": e.args[0], "budget_ledger": meter.apply(state.budget_ledger)}
 
     pending_ids = [sq.id for sq in plan.sub_questions]
     return {
         "plan": plan,
         "pending_subquestion_ids": pending_ids,
-        "budget_ledger": ledger,
+        "budget_ledger": meter.apply(state.budget_ledger),
     }
 
 
 def pick_next_node(state: ResearchState) -> Dict[str, Any]:
     """Picks the next pending sub-question or transitions toward synthesis."""
-    if state.cancellation_requested:
-        return {"status": "cancelled", "termination_reason": "cancelled"}
+    if _cancel_requested(state):
+        return dict(_CANCELLED)
+
+    # The worker turns this flag into a budget_warning event (PRD FR-2.2).
+    warning = {} if state.budget_warning_emitted or budget_usage_ratio(state) < 0.8 else {"budget_warning_emitted": True}
 
     can_proceed, reason = check_budget_guard(state)
     if not can_proceed:
         logger.warning("Budget guard prevented new work dispatch: %s", reason)
-        return {"termination_reason": reason, "active_subquestion_id": None}
+        return {**warning, "termination_reason": reason, "active_subquestion_id": None}
 
     if not state.pending_subquestion_ids:
         logger.info("No more pending sub-questions in queue.")
-        return {"active_subquestion_id": None}
+        return {**warning, "active_subquestion_id": None}
 
     next_id = state.pending_subquestion_ids[0]
     remaining = state.pending_subquestion_ids[1:]
 
     logger.info("Picked next active sub-question: '%s'", next_id)
     return {
+        **warning,
         "active_subquestion_id": next_id,
         "pending_subquestion_ids": remaining,
     }
@@ -85,43 +112,51 @@ def pick_next_node(state: ResearchState) -> Dict[str, Any]:
 
 def research_node(state: ResearchState, researcher_agent: ResearcherAgent) -> Dict[str, Any]:
     """Executes search, fetch, and extraction on the active sub-question."""
-    if state.cancellation_requested:
-        return {"status": "cancelled", "termination_reason": "cancelled"}
+    if _cancel_requested(state):
+        return dict(_CANCELLED)
 
     active_sq = state.get_active_subquestion()
     if not active_sq:
         return {}
 
     logger.info("Executing research for sub-question '%s': %s", active_sq.id, active_sq.question)
-    result, new_findings = researcher_agent.execute_subquestion(active_sq)
+    meter = budget_meter(state)
+    with metered(meter):
+        result, new_findings = researcher_agent.execute_subquestion(
+            active_sq, reformulation_hint=state.rework_hints.get(active_sq.id)
+        )
 
-    ledger = state.budget_ledger
-    ledger.searches += result.searches_used
-    ledger.fetches += result.pages_fetched
-    ledger.llm_calls += result.llm_calls_used
-
-    return {
+    update = {
         "findings": new_findings,
         "failures": result.failures,
-        "budget_ledger": ledger,
+        "budget_ledger": meter.apply(state.budget_ledger),
     }
+    if _cancel_requested(state):
+        update.update(_CANCELLED)
+    return update
 
 
 def review_node(state: ResearchState, supervisor_reviewer: SupervisorReviewer) -> Dict[str, Any]:
     """Reviews the research output for the active sub-question."""
+    if _cancel_requested(state):
+        return {**_CANCELLED, "active_subquestion_id": None}
+
     active_sq = state.get_active_subquestion()
     if not active_sq:
         return {}
 
     # Extract findings belonging to this sub-question
     sq_findings = [f for f in state.findings if f.subquestion_id == active_sq.id]
-    decision = supervisor_reviewer.review(active_sq, sq_findings, state)
+    meter = budget_meter(state)
+    with metered(meter):
+        decision = supervisor_reviewer.review(active_sq, sq_findings, state)
     logger.info("Supervisor decision for '%s': %s (mode: %s)", active_sq.id, decision.decision, decision.mode)
 
     completed = list(state.completed_subquestion_ids)
     abandoned = list(state.abandoned_subquestion_ids)
     pending = list(state.pending_subquestion_ids)
     rework_counts = dict(state.rework_counts)
+    rework_hints = dict(state.rework_hints)
     total_reworks = state.total_reworks
 
     if decision.decision == "accept":
@@ -130,6 +165,7 @@ def review_node(state: ResearchState, supervisor_reviewer: SupervisorReviewer) -
         abandoned.append(active_sq.id)
     elif decision.decision == "rework":
         rework_counts[active_sq.id] = rework_counts.get(active_sq.id, 0) + 1
+        rework_hints[active_sq.id] = decision.reformulation_hint or "; ".join(decision.missing) or decision.reason
         total_reworks += 1
         pending.insert(0, active_sq.id)  # re-queue for immediate rework pass
 
@@ -138,16 +174,18 @@ def review_node(state: ResearchState, supervisor_reviewer: SupervisorReviewer) -
         "abandoned_subquestion_ids": abandoned,
         "pending_subquestion_ids": pending,
         "rework_counts": rework_counts,
+        "rework_hints": rework_hints,
         "total_reworks": total_reworks,
         "active_subquestion_id": None,
+        "budget_ledger": meter.apply(state.budget_ledger),
     }
 
 
 def write_node(state: ResearchState, writer_agent: WriterAgent) -> Dict[str, Any]:
     """Dispatches the Writer agent to synthesize accepted findings into a cited report."""
-    if state.cancellation_requested:
+    if _cancel_requested(state):
         maybe_crash("during_cancellation")
-        return {"status": "cancelled", "termination_reason": "cancelled"}
+        return dict(_CANCELLED)
 
     maybe_crash("during_writing")
     accepted_findings = state.get_accepted_findings()
@@ -158,24 +196,28 @@ def write_node(state: ResearchState, writer_agent: WriterAgent) -> Dict[str, Any
     if state.validation_result and not state.validation_result.valid:
         validation_feedback = "\n".join(state.validation_result.unresolved_citations)
 
+    meter = budget_meter(state)
     try:
-        report = writer_agent.write(
-            question=state.question,
-            plan=state.plan,
-            findings=accepted_findings,
-            abandoned_subquestions=state.abandoned_subquestion_ids,
-            validation_feedback=validation_feedback,
-        )
+        with metered(meter):
+            report = writer_agent.write(
+                question=state.question,
+                plan=state.plan,
+                findings=accepted_findings,
+                abandoned_subquestions=state.abandoned_subquestion_ids,
+                validation_feedback=validation_feedback,
+            )
+    except RunCancelledError:
+        return {**_CANCELLED, "budget_ledger": meter.apply(state.budget_ledger)}
+    except ReplayMissError:
+        raise
     except Exception as e:
+        # Includes BudgetExhaustedError: the fallback needs no LLM call.
         logger.error("Writer agent failed: %s. Generating fallback report.", e)
         report = _build_fallback_report(state.question, accepted_findings, state.plan)
 
-    ledger = state.budget_ledger
-    ledger.llm_calls += 1
-
     return {
         "report": report,
-        "budget_ledger": ledger,
+        "budget_ledger": meter.apply(state.budget_ledger),
     }
 
 
@@ -243,6 +285,8 @@ def _build_fallback_report(
 
 def validate_citations_node(state: ResearchState) -> Dict[str, Any]:
     """Mechanically checks citation resolution, handles bounded regenerations, and re-checks evidence."""
+    if state.status == "cancelled":
+        return {}
     maybe_crash("during_validation")
     if not state.report:
         return {"status": "failed", "termination_reason": "missing_report"}
@@ -272,7 +316,10 @@ def validate_citations_node(state: ResearchState) -> Dict[str, Any]:
     # Max regenerations exhausted: drop unresolved claims & re-check minimum evidence (PRD FR-5.4, FR-2.4)
     logger.warning("Writer regenerations exhausted. Dropping unverified claims.")
     for section in state.report.sections:
-        section.claims = [c for c in section.claims if c not in validation.dropped_claims]
+        kept = [c for c in section.claims if c not in validation.dropped_claims]
+        if len(kept) != len(section.claims):
+            section.content = ""  # the prose may restate a dropped claim; ship only cited claims
+        section.claims = kept
 
     plan_len = len(state.plan.sub_questions) if state.plan else 2
     evidence_ok, reason = check_minimum_evidence_for_report(
@@ -300,8 +347,12 @@ def validate_citations_node(state: ResearchState) -> Dict[str, Any]:
         dropped_claims=validation.dropped_claims,
     )
 
+    # Every remaining citation now resolves, so route to finalize instead of another write (FR-5.4).
+    pruned = validation.model_copy(
+        update={"valid": True, "details": f"Pruned {len(validation.dropped_claims)} claims with unresolved citations."}
+    )
     return {
-        "validation_result": validation,
+        "validation_result": pruned,
         "report": state.report,
     }
 
